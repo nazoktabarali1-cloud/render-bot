@@ -1,5 +1,7 @@
 python-telegram-bot==13.15
 urllib3<2.0
+setuptools
+apscheduler
 yt-dlp
 requests
 requests-toolbelt

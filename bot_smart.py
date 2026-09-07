@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
 # telegram_downloader_bot.py
-# نسخه هوشمند: اجرا هم روی لپ‌تاپ و هم روی Render
+# نسخه هوشمند: اجرا هم روی لپ‌تاپ و هم روی Render (Webhook mode)
 # =====================================================================
 
 import os
@@ -30,12 +30,12 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telegram_downloader")
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Updater, MessageHandler, Filters, CallbackQueryHandler, CommandHandler
 from telegram.error import NetworkError
 
-# --- تغییر ۱: اضافه کردن Flask برای Render ---
-from flask import Flask
+# --- اضافه کردن Flask برای Render ---
+from flask import Flask, request
 
 # Telethon optional
 try:
@@ -61,20 +61,17 @@ except Exception:
     HAS_CRYPTG = False
 
 # -------------------------
-# پیکربندی (این مقادیر را در صورت نیاز تغییر بده)
+# پیکربندی
 # -------------------------
-# توکن ربات را اینجا قرار بده یا از متغیر محیطی استفاده کن
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8460981737:AAFVLyZbSkv6eIqVPXWnEuhjVJYy9TyCCUA")
 
-# Telethon config (اختیاری)
 TELETHON_API_ID = os.environ.get("TELETHON_API_ID", "39999874")
 TELETHON_API_HASH = os.environ.get("TELETHON_API_HASH", "f6c320a19abd4975daaaa2f9d61601ff")
 TELETHON_SESSION = os.environ.get("TELETHON_SESSION", "user_session")
 
-# Force Telethon usage for uploads (set env FORCE_TELETHON_ALWAYS=1 to enable)
 FORCE_TELETHON_ALWAYS = os.environ.get("FORCE_TELETHON_ALWAYS", "0") == "1"
 
-# --- تغییر ۲: تنظیم هوشمند مسیر ذخیره‌سازی ---
+# --- تشخیص محیط اجرا و تنظیم مسیر ذخیره‌سازی ---
 # اگر روی Render باشیم (متغیر PORT ست شده)، از پوشه موقت /tmp استفاده می‌کنیم
 IS_ON_RENDER = bool(os.environ.get("PORT"))
 if IS_ON_RENDER:
@@ -95,12 +92,12 @@ BACKUP_ROOT = Path(DOWNLOAD_ROOT) / "telegram_bot_backups"
 BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
 BACKUP_LOCK = Lock()
 
-# --- تغییر ۳: کاهش حداکثر دانلود همزمان روی Render (برای جلوگیری از کرش) ---
+# --- تنظیم حداکثر دانلود همزمان ---
 if IS_ON_RENDER:
     MAX_CONCURRENT_DOWNLOADS = 2
 else:
     MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "6"))
-MIN_FREE_DISK_GB = 1
+
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "8"))
 REQUEST_TTL_SECONDS = int(os.environ.get("REQUEST_TTL_SECONDS", "300"))
 YTDLP_SOCKET_TIMEOUT = int(os.environ.get("YTDLP_SOCKET_TIMEOUT", "20"))
@@ -121,23 +118,22 @@ NETWORK_BACKOFF_BASE = 1.5
 NETWORK_RETRY_SLEEP_MIN = 1.0
 NETWORK_RETRY_SLEEP_MAX = 30.0
 
-# Keep CHUNK_SIZE for Bot API multipart uploads (safe under 50 MiB)
 CHUNK_SIZE = 48 * 1024 * 1024
 MAX_SINGLE_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 
 # -------------------------
 # وضعیت‌ها و صف‌ها
 # -------------------------
-REQUESTS = {}            # request_id -> {url, formats, info, created, user_id, cancel, error, progress_msg_id}
+REQUESTS = {}
 REQUESTS_LOCK = threading.Lock()
 
 download_queue = Queue()
 active_workers = 0
 active_workers_lock = threading.Lock()
 
-progress_map = {}        # task_id -> progress info
+progress_map = {}
 
-CANCEL_FLAGS = {}        # task_id -> {"cancel": bool, "owner_id": id}
+CANCEL_FLAGS = {}
 CANCEL_LOCK = threading.Lock()
 
 USER_MAP = {}
@@ -165,9 +161,8 @@ def ensure_telethon_client():
         try:
             telethon_client = TelegramClient(TELETHON_SESSION, int(TELETHON_API_ID), TELETHON_API_HASH)
             telethon_client.start()
-            # Log cryptg status for debugging upload performance
             if not HAS_CRYPTG:
-                logger.warning("cryptg not available: Telethon will fall back to slower crypto. Install 'cryptg' for faster uploads.")
+                logger.warning("cryptg not available: Telethon will fall back to slower crypto.")
             else:
                 logger.info("cryptg detected: Telethon will use optimized crypto for uploads.")
             logger.info("Telethon client started.")
@@ -175,10 +170,6 @@ def ensure_telethon_client():
         except Exception as e:
             logger.exception("Failed to start Telethon client: %s", e)
             telethon_client = None
-            try:
-                append_user_log("system", {"event": "telethon_start_failed", "error": str(e)})
-            except Exception:
-                pass
             return None
 
 # -------------------------
@@ -251,13 +242,10 @@ def safe_edit_message(bot, chat_id, message_id, text, reply_markup=None):
             pass
 
 # -------------------------
-# === انیمیشن‌ها: ALI sequence, I Fill و Processing bar ===
-# این بخش به‌صورت افزوده به فایل اصلی اضافه شده و تداخلی با توابع موجود ایجاد نمی‌کند.
-# توجه: تابع human_size در بالا از قبل تعریف شده؛ بنابراین در این بخش دوباره تعریف نشده است.
+# === انیمیشن‌ها ===
 # -------------------------
 
 def format_eta(seconds):
-    """ثانیه -> H:MM:SS یا MM:SS"""
     try:
         s = int(max(0, int(seconds)))
     except Exception:
@@ -269,14 +257,7 @@ def format_eta(seconds):
         return f"{h:d}:{m:02d}:{sec:02d}"
     return f"{m:02d}:{sec:02d}"
 
-# render I with inner fill (I Fill)
 def render_I_with_inner_fill(pct, segments=8, inner_width=5):
-    """
-    pct: 0..100
-    segments: تعداد بخش‌های عمودی داخل I
-    inner_width: عرض داخلی (تعداد کاراکتر)
-    خروجی: بلوک متنی چندخطی با عنوان ALI و درصد
-    """
     try:
         pct = max(0, min(100, int(pct)))
     except:
@@ -300,13 +281,7 @@ def render_I_with_inner_fill(pct, segments=8, inner_width=5):
     parts = [header, "", top_bar] + middle_lines + [bottom_bar, "", footer]
     return "\n".join(parts)
 
-# horizontal ALI branded bar
 def render_horizontal_ali_bar(pct, length=20, left_label="ALI", fill_char="█", empty_char="░"):
-    """
-    pct: 0..100
-    length: طول نوار
-    خروجی: یک خط شامل برچسب، نوار و درصد
-    """
     try:
         pct = max(0, min(100, int(pct)))
     except:
@@ -317,13 +292,7 @@ def render_horizontal_ali_bar(pct, length=20, left_label="ALI", fill_char="█",
     line = f"{left_label} |{bar}| {percent_text}"
     return line
 
-# QualityAnimationALI: ALI sequence frames
 class QualityAnimationALI:
-    """
-    انیمیشن سبک برای مرحله بررسی کیفیت
-    فریم‌ها: A -> Al -> ALI -> AL -> A -> AL
-    استفاده: start(key, bot, chat_id), stop(key)
-    """
     def __init__(self):
         self.map = {}
 
@@ -376,12 +345,7 @@ class QualityAnimationALI:
                 i += 1
             time.sleep(0.12)
 
-# General QualityAnimation with I Fill mode (passive updates)
 class QualityAnimation:
-    """
-    حالت i_fill: نمایش درصد داخل حرف I
-    متدها: start, update_i_fill, stop
-    """
     def __init__(self):
         self.map = {}
 
@@ -431,13 +395,7 @@ class QualityAnimation:
             pass
         self.map.pop(key, None)
 
-# ProcessingAnimation: progress bar for processing/upload/download stages
 class ProcessingAnimation:
-    """
-    نمایش پردازش پس از دانلود/آپلود
-    متدها: start, update, stop
-    update می‌تواند stage, pct, transferred, total, speed_bps را بگیرد
-    """
     def __init__(self):
         self.map = {}
 
@@ -474,7 +432,6 @@ class ProcessingAnimation:
         if pct is not None:
             info["pct"] = max(0, min(100, int(pct)))
 
-        # محاسبه سرعت اگر داده نشده
         if speed_bps is None and transferred is not None:
             prev = info.get("last_transferred")
             prev_t = info.get("last_transferred_time")
@@ -526,7 +483,7 @@ class ProcessingAnimation:
             pass
         self.map.pop(key, None)
 
-# global instances for quick use
+# global instances
 quality_ali_anim = QualityAnimationALI()
 quality_anim = QualityAnimation()
 proc_anim = ProcessingAnimation()
@@ -560,7 +517,7 @@ def get_remote_size(url):
         return None
 
 # -------------------------
-# Retry decorator for network operations
+# Retry decorator
 # -------------------------
 def retry_on_network_errors(max_retries=NETWORK_MAX_RETRIES, base_backoff=NETWORK_BACKOFF_BASE):
     def deco(func):
@@ -617,9 +574,9 @@ def extract_info_safe(url):
     except yt_dlp.utils.DownloadError as e:
         msg = str(e)
         if "HTTP Error 403" in msg or "Cloudflare" in msg or "impersonate" in msg:
-            raise ExtractError("منبع با محافظت Cloudflare یا نیاز به impersonation مواجه است. لطفاً yt-dlp را با افزونهٔ impersonation نصب یا به‌روز کن.")
+            raise ExtractError("منبع با محافظت Cloudflare یا نیاز به impersonation مواجه است.")
         if "Unable to extract" in msg or "flashvars" in msg:
-            raise ExtractError("محتوا قابل استخراج نیست. ممکن است yt-dlp نیاز به به‌روزرسانی یا گزارش باگ داشته باشد.")
+            raise ExtractError("محتوا قابل استخراج نیست.")
         raise ExtractError(f"خطا در استخراج اطلاعات: {msg}")
     except Exception as e:
         raise ExtractError(f"خطای غیرمنتظره در استخراج: {str(e)}")
@@ -628,22 +585,11 @@ def extract_info_safe(url):
 # parse_formats_from_info
 # -------------------------
 def parse_formats_from_info(info):
-    """
-    نسخهٔ به‌روز: همهٔ فرمت‌ها را نگه می‌دارد (video-only, audio-only, muxed).
-    هدف: نمایش تمام کیفیت‌های ممکن مانند بات‌های حرفه‌ای.
-    خروجی: لیستی از دیکشنری‌ها با کلیدهای مشابه نسخهٔ قبلی:
-      format_id, ext, resolution, height, size, size_text, label, url, is_preview, mime, note
-    توضیح:
-      - اگر فرمت video-only باشد، label شامل '(video-only)' می‌شود.
-      - اگر audio-only باشد، label شامل 'audio' و نرخ بیت (در صورت وجود) می‌شود.
-      - اگر فرمت muxed (video+audio) باشد، resolution/height نمایش داده می‌شود.
-    """
     formats = info.get("formats", []) or []
     parsed = []
     seen = set()
     head_requests = 0
 
-    # build a size_map from available filesize fields to help fill missing sizes
     size_map = {}
     for f in formats:
         try:
@@ -662,7 +608,6 @@ def parse_formats_from_info(info):
         except:
             continue
 
-    # Reset head_requests counter for second pass
     head_requests = 0
 
     for f in formats:
@@ -670,43 +615,37 @@ def parse_formats_from_info(info):
             fid = str(f.get("format_id") or "")
             ext = (f.get("ext") or "").lower()
             height = f.get("height")
-            # resolution may be like "1920x1080" or "1080p"
             res = f.get("resolution") or (str(height) + "p" if height else "")
             size = f.get("filesize") or f.get("filesize_approx") or None
             url = f.get("url") or None
             mime = f.get("mime_type") or ""
             acodec = f.get("acodec") or ""
             vcodec = f.get("vcodec") or ""
-            abr = f.get("abr")  # audio bitrate (kbps)
-            tbr = f.get("tbr")  # total bitrate
+            abr = f.get("abr")
+            tbr = f.get("tbr")
             format_note = f.get("format_note") or ""
 
-            # try to infer height from resolution if missing
             if not height and isinstance(res, str) and res.endswith("p"):
                 try:
                     height = int(res.rstrip("p"))
                 except:
                     height = None
 
-            # fill size from size_map if missing
             if not size and height and ext:
                 s = size_map.get((int(height), ext))
                 if s:
                     size = s
 
-            # fallback to HEAD request if still missing and allowed
             if not size and url and head_requests < MAX_HEAD_REQUESTS_PER_PARSE:
                 remote_size = get_remote_size(url)
                 if remote_size:
                     size = remote_size
                 head_requests += 1
 
-            # determine type: video-only, audio-only, or muxed
             is_video_only = (acodec in (None, "none", "unknown") or acodec == "none") and (vcodec and vcodec != "none")
             is_audio_only = (vcodec in (None, "none", "unknown") or vcodec == "none") and (acodec and acodec != "none")
             is_muxed = not is_video_only and not is_audio_only
 
-            # create label
             label_parts = []
             if height:
                 label_parts.append(f"{height}p")
@@ -721,7 +660,6 @@ def parse_formats_from_info(info):
                 label_parts.append(format_note)
             label = " ".join(label_parts) if label_parts else (ext.upper() if ext else "file")
 
-            # small files as preview
             is_preview = False
             if size and size < 300 * 1024:
                 is_preview = True
@@ -756,7 +694,6 @@ def parse_formats_from_info(info):
         except Exception:
             continue
 
-    # Sort: prefer higher video height first, then muxed over video-only, then audio-only last
     def sort_key(x):
         h = x.get("height") or 0
         mux = 2 if x.get("is_muxed") else (1 if x.get("is_video_only") else 0)
@@ -764,7 +701,6 @@ def parse_formats_from_info(info):
 
     parsed.sort(key=lambda x: (-sort_key(x)[0], -sort_key(x)[1], x.get("ext") or ""))
 
-    # If nothing parsed, fallback to raw formats minimal mapping (preserve as much as possible)
     if not parsed:
         raw_formats = info.get("formats", []) or []
         for f in raw_formats:
@@ -809,11 +745,6 @@ def build_category_tabs(request_id, active_category):
     return tabs
 
 def make_quality_keyboard(parsed_formats, request_id, category="mp4", page=0):
-    """
-    این کیبورد اکنون از parsed_formats که شامل video-only و audio-only است استفاده می‌کند.
-    دسته‌بندی: mp4, webm, other
-    هر آیتم برچسبی دارد که شامل رزولوشن و نوع (video-only / audio) است.
-    """
     mp4_formats = [f for f in parsed_formats if f.get("ext") == "mp4"]
     webm_formats = [f for f in parsed_formats if f.get("ext") == "webm"]
     other_formats = [f for f in parsed_formats if f.get("ext") not in ("mp4", "webm")]
@@ -833,14 +764,12 @@ def make_quality_keyboard(parsed_formats, request_id, category="mp4", page=0):
         for p in chosen[start:end]:
             size_text = p.get("size_text") or "—"
             label = p.get("label") or (p.get("resolution") or p.get("ext") or "file")
-            # If audio-only, show audio label clearly
             if p.get("is_audio_only"):
                 text = f"{label} • {size_text} • {p['ext']} • audio-only"
             elif p.get("is_video_only"):
                 text = f"{label} • {size_text} • {p['ext']} • video-only"
             else:
                 text = f"{label} • {size_text} • {p['ext']}"
-            # For preview small files, map to best
             if p.get("is_preview"):
                 cb = f"dl:{request_id}:best"
             else:
@@ -1016,16 +945,9 @@ def yt_dlp_download_with_hook(url, outtmpl, format_spec=None, postprocessors=Non
         return filename
 
 # -------------------------
-# upload with progress (Bot API) - supports sendDocument and sendAnimation
+# upload with progress (Bot API)
 # -------------------------
 def upload_file_with_progress(bot_token, chat_id, file_path, caption, progress_callback, timeout=3600, task_id=None, api_method="sendDocument"):
-    """
-    api_method: "sendDocument" or "sendAnimation"
-    بهبودها:
-    - session.trust_env = False و proxies=None تا پراکسی سیستم نادیده گرفته شود (رفع ProxyError/SSLEOF)
-    - retry با backoff برای خطاهای شبکه
-    - keep-alive حفظ شده
-    """
     if api_method not in ("sendDocument", "sendAnimation"):
         api_method = "sendDocument"
     url = f"https://api.telegram.org/bot{bot_token}/{api_method}"
@@ -1033,7 +955,7 @@ def upload_file_with_progress(bot_token, chat_id, file_path, caption, progress_c
     field_name = "document" if api_method == "sendDocument" else "animation"
 
     session = requests.Session()
-    session.trust_env = False  # مهم: پراکسی سیستم (HTTP_PROXY/HTTPS_PROXY) را کاملاً نادیده بگیر
+    session.trust_env = False
     session.headers.update({"Connection": "keep-alive", "User-Agent": USER_AGENT_HEAD})
 
     max_attempts = 4
@@ -1107,15 +1029,9 @@ def upload_file_with_progress(bot_token, chat_id, file_path, caption, progress_c
     raise last_exc if last_exc else RuntimeError("Upload failed after retries")
 
 # -------------------------
-# Telethon send helper (cancellable, improved)
+# Telethon send helper
 # -------------------------
 def telethon_send_file(chat_id, file_path, caption=None, progress_callback=None, task_id=None):
-    """
-    ارسال فایل با Telethon با بهبود:
-    - تنظیم part_size_kb بر اساس اندازه فایل برای کاهش تعداد chunkها
-    - retry با backoff و jitter برای افزایش پایداری
-    - بررسی CANCEL_FLAGS در progress callback
-    """
     client = ensure_telethon_client()
     if not client:
         raise RuntimeError("Telethon client not configured or not available.")
@@ -1125,7 +1041,6 @@ def telethon_send_file(chat_id, file_path, caption=None, progress_callback=None,
     except Exception:
         file_size = None
 
-    # تعیین اندازه بخش (کیلوبایت) برای Telethon (حداقل 256KB، حداکثر 4096KB)
     def choose_part_size_kb(size_bytes):
         if not size_bytes:
             return 512
@@ -1140,7 +1055,6 @@ def telethon_send_file(chat_id, file_path, caption=None, progress_callback=None,
 
     part_size_kb = choose_part_size_kb(file_size)
 
-    # Telethon's send_file supports 'part_size_kb' parameter; use retries
     max_attempts = 5
     attempt = 0
     last_exc = None
@@ -1148,7 +1062,6 @@ def telethon_send_file(chat_id, file_path, caption=None, progress_callback=None,
     while attempt < max_attempts:
         attempt += 1
         try:
-            # wrapped progress to check cancellation
             def wrapped_progress(sent, total):
                 if task_id:
                     with CANCEL_LOCK:
@@ -1158,42 +1071,29 @@ def telethon_send_file(chat_id, file_path, caption=None, progress_callback=None,
                 if progress_callback:
                     progress_callback(sent, total)
 
-            # Telethon send_file is coroutine; run it synchronously here
             coro = client.send_file(entity=chat_id, file=file_path, caption=caption or "", progress_callback=wrapped_progress, part_size_kb=part_size_kb)
             client.loop.run_until_complete(coro)
             return True
         except Exception as e:
             last_exc = e
-            # If cancellation requested, stop retrying
             with CANCEL_LOCK:
                 flag = CANCEL_FLAGS.get(task_id)
                 if flag and flag.get("cancel"):
                     raise Exception("Upload cancelled by user")
-            # For certain Telethon/network errors, retry with backoff + jitter
             wait = min(10 * attempt, 60)
             jitter = random.uniform(0, 2.0)
             logger.warning("Telethon upload attempt %d failed: %s. Retrying in %ds (+%.2fs jitter) (part_size_kb=%d).", attempt, str(e), wait, jitter, part_size_kb)
             time.sleep(wait + jitter)
-            # On retry, consider increasing part_size_kb slightly to reduce chunk count
             if part_size_kb < 4096:
                 part_size_kb = min(4096, int(part_size_kb * 2))
             continue
 
-    # If we reach here, all attempts failed
     raise last_exc if last_exc else RuntimeError("Unknown error during Telethon upload")
 
 # -------------------------
-# upload selection: زیر 30 مگ -> Bot API، بالای 30 مگ -> Telethon
+# upload selection
 # -------------------------
 def upload_with_smart_choice(bot_token, bot, chat_id, file_path, caption, progress_update_fn=None, task_id=None, as_animation=False):
-    """
-    انتخاب مسیر آپلود:
-    - اگر FORCE_TELETHON_ALWAYS فعال باشد: همیشه از Telethon استفاده کن (تا سقف 2GiB)
-    - اگر فایل <= 30MB: اول Bot API؛ در صورت خطای شبکه/پراکسی به Telethon fallback کن
-    - اگر فایل > 30MB و <= 2 GiB: از Telethon استفاده کن
-    - اگر فایل > 2 GiB: خطا بده
-    - as_animation: اگر True و Bot API انتخاب شد، از sendAnimation استفاده کن تا گیف‌ها به‌صورت انیمیشن ارسال شوند
-    """
     total_size = os.path.getsize(file_path)
 
     def telethon_progress(sent, total):
@@ -1203,7 +1103,6 @@ def upload_with_smart_choice(bot_token, bot, chat_id, file_path, caption, progre
         except Exception:
             raise
 
-    # If forced Telethon usage
     if FORCE_TELETHON_ALWAYS:
         if total_size > MAX_SINGLE_UPLOAD_BYTES:
             raise RuntimeError(f"File size {human_size(total_size)} exceeds 2 GiB limit.")
@@ -1212,7 +1111,6 @@ def upload_with_smart_choice(bot_token, bot, chat_id, file_path, caption, progre
     if total_size > MAX_SINGLE_UPLOAD_BYTES:
         raise RuntimeError(f"File size {human_size(total_size)} exceeds 2 GiB limit.")
 
-    # Threshold: 30 MB
     threshold = 30 * 1024 * 1024
     if total_size <= threshold:
         api_method = "sendAnimation" if as_animation else "sendDocument"
@@ -1233,15 +1131,10 @@ def upload_with_smart_choice(bot_token, bot, chat_id, file_path, caption, progre
                 "eof", "ssleof", "unable to connect", "network"
             )
             if any(k in err_str for k in network_keywords):
-                logger.warning(
-                    "Bot API failed with network/proxy error, falling back to Telethon: %s",
-                    str(e)[:150]
-                )
-                # ادامه به Telethon
+                logger.warning("Bot API failed with network/proxy error, falling back to Telethon: %s", str(e)[:150])
             else:
-                raise  # خطای غیرشبکه‌ای را بالا بده
+                raise
 
-    # Telethon (فایل بزرگ یا fallback)
     return telethon_send_file(
         chat_id, file_path,
         caption=caption,
@@ -1269,24 +1162,18 @@ def download_worker_thread(bot):
             username = task.get("username") or None
             request_id = task.get("request_id")
             request_info = task.get("request_info")
-            mode = task.get("mode") or "telegram"  # 'telegram' or 'local'
+            mode = task.get("mode") or "telegram"
 
-            # create a unique task_id early
             task_id = uuid.uuid4().hex[:12]
             with CANCEL_LOCK:
                 CANCEL_FLAGS[task_id] = {"cancel": False, "owner_id": owner_id}
 
-            # initial progress message with cancel button
             try:
                 progress_msg = bot.send_message(chat_id=chat_id, text="در حال آماده‌سازی دانلود...", reply_markup=make_cancel_markup(task_id, owner_id))
                 progress_msg_id = progress_msg.message_id
             except Exception:
                 progress_msg = bot.send_message(chat_id=chat_id, text="در حال آماده‌سازی دانلود...")
                 progress_msg_id = progress_msg.message_id
-                try:
-                    bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text="در حال آماده‌سازی دانلود...", reply_markup=make_cancel_markup(task_id, owner_id))
-                except:
-                    pass
 
             append_user_log(get_log_key_for_user(owner_id), {
                 "event": "download_request",
@@ -1297,7 +1184,6 @@ def download_worker_thread(bot):
                 "mode": mode
             })
 
-            # check request-level cancel
             if request_id:
                 with REQUESTS_LOCK:
                     req = REQUESTS.get(request_id)
@@ -1306,40 +1192,25 @@ def download_worker_thread(bot):
                         bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text="❌ این درخواست قبلاً لغو شده است.")
                     except:
                         pass
-                    append_user_log(get_log_key_for_user(owner_id), {"event": "request_cancelled_before_start", "request_id": request_id})
                     with CANCEL_LOCK:
                         CANCEL_FLAGS.pop(task_id, None)
                     continue
 
-            # use request_info if provided to avoid re-extract
             info = None
             if request_info:
                 info = request_info
             else:
                 try:
-                    append_user_log(get_log_key_for_user(owner_id), {"event": "extract_start", "url": url, "task_id": task_id})
                     info = extract_info_safe(url)
-                    append_user_log(get_log_key_for_user(owner_id), {"event": "extract_ok", "url": url, "title": info.get("title") if info else None, "task_id": task_id})
-                except ExtractError as e:
-                    try:
-                        bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text=f"❗ خطا در استخراج اطلاعات: {str(e)}")
-                    except:
-                        pass
-                    append_user_log(get_log_key_for_user(owner_id), {"event": "extract_error", "error": str(e), "url": url, "task_id": task_id})
-                    with CANCEL_LOCK:
-                        CANCEL_FLAGS.pop(task_id, None)
-                    continue
                 except Exception as e:
                     try:
                         bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text=f"❗ خطا در استخراج اطلاعات: {str(e)}")
                     except:
                         pass
-                    append_user_log(get_log_key_for_user(owner_id), {"event": "extract_error", "error": str(e), "url": url, "task_id": task_id})
                     with CANCEL_LOCK:
                         CANCEL_FLAGS.pop(task_id, None)
                     continue
 
-            # Determine final format_spec
             final_format_spec = None
             if action == "audio":
                 final_format_spec = "bestaudio/best"
@@ -1350,7 +1221,6 @@ def download_worker_thread(bot):
                     else:
                         final_format_spec = "best"
                 else:
-                    # try to validate format_id exists in parsed formats
                     parsed = parse_formats_from_info(info) if info else []
                     found = any(p.get("format_id") == format_id for p in parsed)
                     if not found:
@@ -1359,7 +1229,6 @@ def download_worker_thread(bot):
                         else:
                             final_format_spec = "best"
                     else:
-                        # اگر فرمت انتخابی video-only باشد، با اضافه کردن +bestaudio/best صدای مناسب هم دانلود می‌شود
                         final_format_spec = f"{format_id}+bestaudio/best"
 
             safe_base = sanitize_name((info.get("title") if info else "file") or "file")
@@ -1386,18 +1255,15 @@ def download_worker_thread(bot):
                         bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text="❌ دانلود توسط کاربر لغو شد.")
                     except:
                         pass
-                    append_user_log(get_log_key_for_user(owner_id), {"event": "download_cancelled", "task_id": task_id})
                 else:
                     try:
                         bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text=f"❗ خطا در دانلود: {str(e)}")
                     except:
                         pass
-                    append_user_log(get_log_key_for_user(owner_id), {"event": "download_error", "error": str(e), "url": url, "task_id": task_id})
                 with CANCEL_LOCK:
                     CANCEL_FLAGS.pop(task_id, None)
                 continue
 
-            # find actual file path
             found = None
             try:
                 if os.path.exists(filename):
@@ -1416,7 +1282,6 @@ def download_worker_thread(bot):
                     bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text="❗ فایل دانلود شده پیدا نشد")
                 except:
                     pass
-                append_user_log(get_log_key_for_user(owner_id), {"event": "file_not_found_after_download", "url": url, "task_id": task_id})
                 with CANCEL_LOCK:
                     CANCEL_FLAGS.pop(task_id, None)
                 continue
@@ -1450,11 +1315,9 @@ def download_worker_thread(bot):
 
             try:
                 if file_size and file_size > MAX_SINGLE_UPLOAD_BYTES:
-                    bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text=f"❗ فایل بسیار بزرگ است ({human_size(file_size)}). حداکثر آپلود تک‌مرحله‌ای {human_size(MAX_SINGLE_UPLOAD_BYTES)} است.", reply_markup=make_cancel_markup(task_id, owner_id))
-                    append_user_log(get_log_key_for_user(owner_id), {"event": "upload_too_large", "file_size": file_size, "limit": MAX_SINGLE_UPLOAD_BYTES, "task_id": task_id})
+                    bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text=f"❗ فایل بسیار بزرگ است ({human_size(file_size)}).", reply_markup=make_cancel_markup(task_id, owner_id))
                     with CANCEL_LOCK:
                         CANCEL_FLAGS.pop(task_id, None)
-                    # remove downloaded file to save space
                     try:
                         if os.path.exists(found):
                             os.remove(found)
@@ -1462,7 +1325,6 @@ def download_worker_thread(bot):
                         pass
                     continue
 
-                # If user chose local save, move file to user's downloads folder
                 if mode == "local":
                     try:
                         udir = ensure_user_dir(username or owner_id)
@@ -1470,13 +1332,11 @@ def download_worker_thread(bot):
                         dest_dir.mkdir(parents=True, exist_ok=True)
                         dest_name = os.path.basename(found)
                         dest_path = dest_dir / dest_name
-                        # if file exists, add suffix
                         if dest_path.exists():
                             base, ext = os.path.splitext(dest_name)
                             dest_path = dest_dir / f"{base}_{int(time.time())}{ext}"
                         shutil.move(found, str(dest_path))
                         bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text=f"💾 فایل در پوشهٔ محلی ذخیره شد: {str(dest_path)}")
-                        append_user_log(get_log_key_for_user(owner_id), {"event": "saved_local", "path": str(dest_path), "size": file_size, "task_id": task_id})
                         with CANCEL_LOCK:
                             CANCEL_FLAGS.pop(task_id, None)
                         continue
@@ -1485,30 +1345,23 @@ def download_worker_thread(bot):
                             bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text=f"❗ خطا در ذخیره محلی: {str(e)}")
                         except:
                             pass
-                        append_user_log(get_log_key_for_user(owner_id), {"event": "save_local_error", "error": str(e), "task_id": task_id})
-                        # fall through to attempt upload to telegram as fallback
 
-                # For Telegram mode: if GIF and small enough, send as animation to preserve playback
                 ext = os.path.splitext(found)[1].lower()
                 is_gif = ext == ".gif"
                 bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text=f"⬆️ در حال آپلود فایل ({human_size(file_size)}) ...", reply_markup=make_cancel_markup(task_id, owner_id))
 
                 if is_gif:
-                    # prefer sendAnimation when using Bot API and file small enough
                     if file_size and file_size <= CHUNK_SIZE:
                         upload_with_smart_choice(TOKEN, bot, chat_id, found, caption=info.get("title") or "", progress_update_fn=upload_progress_cb, task_id=task_id, as_animation=True)
                     else:
-                        # large gif -> upload as document (or via Telethon)
                         upload_with_smart_choice(TOKEN, bot, chat_id, found, caption=info.get("title") or "", progress_update_fn=upload_progress_cb, task_id=task_id, as_animation=False)
                 else:
-                    # normal file
                     upload_with_smart_choice(TOKEN, bot, chat_id, found, caption=info.get("title") or "", progress_update_fn=upload_progress_cb, task_id=task_id, as_animation=False)
 
                 try:
                     bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text="✅ آپلود انجام شد")
                 except:
                     pass
-                append_user_log(get_log_key_for_user(owner_id), {"event": "upload_success", "file": found, "size": file_size, "task_id": task_id})
             except Exception as e:
                 with CANCEL_LOCK:
                     flag = CANCEL_FLAGS.get(task_id)
@@ -1518,13 +1371,11 @@ def download_worker_thread(bot):
                         bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text="❌ عملیات توسط کاربر لغو شد.")
                     except:
                         pass
-                    append_user_log(get_log_key_for_user(owner_id), {"event": "cancelled_by_user", "task_id": task_id})
                 else:
                     try:
                         bot.edit_message_text(chat_id=chat_id, message_id=progress_msg_id, text=f"❗ خطا در آپلود: {str(e)}")
                     except:
                         pass
-                    append_user_log(get_log_key_for_user(owner_id), {"event": "upload_error", "error": str(e), "file": found, "task_id": task_id})
                 with CANCEL_LOCK:
                     CANCEL_FLAGS.pop(task_id, None)
                 try:
@@ -1536,10 +1387,7 @@ def download_worker_thread(bot):
 
             try:
                 if os.path.exists(found):
-                    try:
-                        os.remove(found)
-                    except:
-                        pass
+                    os.remove(found)
             except:
                 pass
 
@@ -1652,12 +1500,6 @@ def start(update, context):
     update.message.reply_text("سلام! لینک یا یوزرنیم کانال را ارسال کن یا از /channel استفاده کن.")
 
 def process_single_link(update, context, link):
-    """
-    تغییرات:
-      - انیمیشن ALI sequence یا I Fill را در ابتدای پردازش شروع می‌کنیم (key یکتا)
-      - پس از آماده شدن کیبورد یا خطا، انیمیشن را متوقف می‌کنیم
-      - بقیهٔ منطق بدون تغییر باقی مانده است
-    """
     chat_id = update.message.chat_id
     user = update.message.from_user
     user_id = user.id
@@ -1666,17 +1508,14 @@ def process_single_link(update, context, link):
     with USER_MAP_LOCK:
         USER_MAP[user_id] = username
 
-    # create a unique request id and animation key
     request_id = uuid.uuid4().hex[:12]
     anim_key = f"quality_anim_{request_id}"
 
-    # start ALI animation immediately to show activity
     try:
         quality_ali_anim.start(anim_key, bot=context.bot, chat_id=chat_id, title="در حال بررسی کیفیت…", min_interval=0.9)
     except Exception:
         pass
 
-    # extract once and store
     try:
         info = extract_info_safe(link)
     except ExtractError as e:
@@ -1685,7 +1524,6 @@ def process_single_link(update, context, link):
         except:
             pass
         context.bot.send_message(chat_id=chat_id, text=f"❗ خطا: {str(e)}")
-        append_user_log(get_log_key_for_user(user_id), {"event": "extract_error", "url": link, "error": str(e)})
         return
     except Exception as e:
         try:
@@ -1693,7 +1531,6 @@ def process_single_link(update, context, link):
         except:
             pass
         context.bot.send_message(chat_id=chat_id, text=f"❗ خطا در استخراج اطلاعات: {str(e)}")
-        append_user_log(get_log_key_for_user(user_id), {"event": "extract_error", "url": link, "error": str(e)})
         return
 
     parsed_formats = parse_formats_from_info(info)
@@ -1716,7 +1553,6 @@ def process_single_link(update, context, link):
             "progress_msg_id": None
         }
 
-    # send initial message with cancel button immediately
     try:
         msg = context.bot.send_message(chat_id=chat_id, text=f"{meta}\n\nدر حال آماده‌سازی کیبورد...", reply_markup=make_request_cancel_markup(request_id, user_id))
         with REQUESTS_LOCK:
@@ -1726,7 +1562,6 @@ def process_single_link(update, context, link):
         with REQUESTS_LOCK:
             REQUESTS[request_id]["progress_msg_id"] = msg.message_id
 
-    # build keyboard in background to avoid blocking
     def build_and_attach_keyboard(rid, bot, chat_id, msg_id):
         with REQUESTS_LOCK:
             req = REQUESTS.get(rid)
@@ -1736,7 +1571,6 @@ def process_single_link(update, context, link):
             except:
                 pass
             return
-        # check cancel before building
         if req.get("cancel"):
             try:
                 bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="❌ این درخواست لغو شد.")
@@ -1753,7 +1587,6 @@ def process_single_link(update, context, link):
         kb = make_quality_keyboard(parsed, rid, category=default_cat, page=0)
         try:
             bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id, reply_markup=kb)
-            # stop animation now that keyboard is ready
             try:
                 quality_ali_anim.stop(anim_key)
             except:
@@ -1842,13 +1675,6 @@ def handle_channel_cmd(update, context):
         update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
 def handle_message(update, context):
-    """
-    تغییرات:
-      - به محض دریافت پیام حاوی لینک، یک پیام فوری 'لینک دریافت شد' ارسال می‌شود
-      - انیمیشن ALI sequence نیز بلافاصله شروع می‌شود (تا زمانی که process_single_link آن را متوقف کند)
-      - برای لینک‌های شبکه اجتماعی (اینستاگرام، X، فیس‌بوک و ...) دیگر مستقیم به صف اضافه نمی‌شود؛
-        بلکه همانند لینک‌های معمولی وارد process_single_link می‌شود تا کیفیت‌ها شناسایی شده و سپس از کاربر پرسیده شود کجا ذخیره شود.
-    """
     text = (update.message.text or "").strip()
     chat_id = update.message.chat_id
     user = update.message.from_user
@@ -1865,7 +1691,6 @@ def handle_message(update, context):
     links = re.findall(r'https?://\S+', text)
     if len(links) > 1:
         for link in links:
-            # send immediate acknowledgement and start animation per-link
             try:
                 context.bot.send_message(chat_id=chat_id, text="لینک دریافت شد. در حال آماده‌سازی...")
             except:
@@ -1881,21 +1706,17 @@ def handle_message(update, context):
         return search_youtube_channel(uname, update, context)
 
     if text.startswith("http"):
-        # immediate acknowledgement and start a short-lived animation message
         try:
             ack_msg = context.bot.send_message(chat_id=chat_id, text="لینک دریافت شد. در حال بررسی...")
         except:
             ack_msg = None
-        # For social links, do NOT enqueue directly; instead show qualities and then ask mode (process_single_link)
         if is_instagram_or_x(text):
             try:
                 context.bot.send_message(chat_id=chat_id, text="🔎 لینک شبکه اجتماعی شناسایی شد — در حال بررسی کیفیت و آماده‌سازی گزینه‌ها...")
             except:
                 pass
             process_single_link(update, context, text)
-            append_user_log(get_log_key_for_user(user_id), {"event": "social_link_received", "url": text})
             return
-        # call process_single_link which will manage animations and keyboard
         process_single_link(update, context, text)
         return
 
@@ -1968,7 +1789,6 @@ def channel_callback_handler(update, context):
                 req["cancel"] = True
                 req["error"] = "درخواست توسط کاربر لغو شد."
                 REQUESTS[request_id] = req
-        # propagate to active tasks
         with CANCEL_LOCK:
             for t_id, entry in list(CANCEL_FLAGS.items()):
                 if entry.get("owner_id") == owner_id:
@@ -1977,7 +1797,6 @@ def channel_callback_handler(update, context):
             query.edit_message_text("❌ درخواست لغو شد.")
         except:
             pass
-        append_user_log(get_log_key_for_user(owner_id), {"event": "cancel_requested", "request_id": request_id})
         query.answer("درخواست لغو شد")
         return
 
@@ -1997,7 +1816,6 @@ def channel_callback_handler(update, context):
                     REQUESTS[req_id] = req
             except Exception as e:
                 safe_edit_message(context.bot, chat_id, message_id, f"خطا در دریافت ویدیوها: {str(e)}")
-                append_user_log(get_log_key_for_user(user.id), {"event": "channel_videos_error", "error": str(e), "req_id": req_id})
                 return
         send_channel_videos_page_by_req(req_id, 0, context.bot, query)
         return
@@ -2024,7 +1842,6 @@ def channel_callback_handler(update, context):
                 pass
         except Exception as e:
             safe_edit_message(context.bot, chat_id, message_id, f"خطا در دریافت پلی‌لیست‌ها: {str(e)}")
-            append_user_log(get_log_key_for_user(user.id), {"event": "playlists_error", "error": str(e), "req_id": req_id})
         return
 
     if data.startswith("playlist_queue:"):
@@ -2058,11 +1875,9 @@ def channel_callback_handler(update, context):
                     "request_id": None,
                     "request_info": None
                 })
-            append_user_log(get_log_key_for_user(user.id), {"event": "playlist_queued", "playlist_url": url, "num_videos": len(videos)})
             safe_edit_message(context.bot, chat_id, message_id, f"پلی‌لیست با {len(videos)} ویدیو به صف اضافه شد.")
         except Exception as e:
             safe_edit_message(context.bot, chat_id, message_id, f"خطا در صف‌بندی پلی‌لیست: {str(e)}")
-            append_user_log(get_log_key_for_user(user.id), {"event": "playlist_queue_error", "playlist_url": url, "error": str(e)})
         return
 
     if data.startswith("cancel_dl:"):
@@ -2082,7 +1897,6 @@ def channel_callback_handler(update, context):
             safe_edit_message(context.bot, chat_id, message_id, "❌ درخواست لغو ارسال شد. در حال متوقف کردن دانلود/آپلود...")
         except:
             pass
-        append_user_log(get_log_key_for_user(owner_id), {"event": "cancel_requested", "task_id": task_id})
         query.answer("درخواست لغو ارسال شد")
         return
 
@@ -2137,7 +1951,6 @@ def channel_callback_handler(update, context):
             action = "video"
             format_id = fmt
         try:
-            # After user selects quality, ask where to save (telegram or local)
             query.edit_message_text(text="می‌خوای فایل چطور تحویل داده بشه؟", reply_markup=make_output_mode_keyboard(request_id, format_id or "best"))
         except:
             try:
@@ -2166,7 +1979,6 @@ def channel_callback_handler(update, context):
         url = req["url"]
         action = "audio" if fmt == "audio" else "video"
         format_id = fmt if fmt != "best" else "best"
-        # enqueue download and pass request_info to avoid re-extract
         download_queue.put({
             "group_id": None,
             "user_id": user.id,
@@ -2180,7 +1992,6 @@ def channel_callback_handler(update, context):
             "request_id": request_id,
             "request_info": req.get("info")
         })
-        append_user_log(get_log_key_for_user(user.id), {"event": "download_request", "url": url, "format_requested": format_id or "best", "mode": mode, "request_id": request_id})
         try:
             safe_edit_message(context.bot, chat_id, message_id, "✅ درخواست دریافت شد و به صف اضافه شد.")
         except:
@@ -2207,7 +2018,6 @@ def channel_callback_handler(update, context):
             "request_id": None,
             "request_info": None
         })
-        append_user_log(get_log_key_for_user(user.id), {"event": "download_request_direct", "url": vurl})
         try:
             safe_edit_message(context.bot, chat_id, message_id, "✅ درخواست دانلود مستقیم به صف اضافه شد.")
         except:
@@ -2225,7 +2035,7 @@ def channel_callback_handler(update, context):
     query.answer()
 
 # -------------------------
-# main with resilient polling
+# main (Webhook mode for Render, Polling for Laptop)
 # -------------------------
 def start_workers(bot, n=4):
     for _ in range(n):
@@ -2237,25 +2047,33 @@ def get_log_key_for_user(user_id):
         uname = USER_MAP.get(user_id)
     return uname if uname else user_id
 
-# -------------------------
-# اضافه کردن Flask برای Render
-# -------------------------
+# ایجاد وب‌سرور Flask
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Bot is alive!"
 
+# مسیر دریافت Webhook از تلگرام
+@app.route(f'/webhook/{TOKEN}', methods=['POST'])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), bot)
+    dispatcher.process_update(update)
+    return 'OK', 200
+
 def main():
+    global bot, dispatcher
+    
     updater = Updater(TOKEN, use_context=True)
-    dp = updater.dispatcher
+    bot = updater.bot
+    dispatcher = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("channel", handle_channel_cmd))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
     dp.add_handler(CallbackQueryHandler(channel_callback_handler))
 
-    start_workers(updater.bot, n=MAX_CONCURRENT_DOWNLOADS)
+    start_workers(bot, n=MAX_CONCURRENT_DOWNLOADS)
 
     if TELETHON_API_ID and TELETHON_API_HASH:
         try:
@@ -2263,19 +2081,12 @@ def main():
         except Exception as e:
             logger.exception("Telethon init failed: %s", e)
 
-    # اگر روی Render باشیم، همزمان Polling و وب‌سرور را اجرا می‌کنیم
     if IS_ON_RENDER:
-        import threading
-        # اجرای Polling در یک Thread جداگانه تا وب‌سرور بلاک نشود
-        def run_bot():
-            try:
-                updater.start_polling()
-            except Exception as e:
-                print(f"Polling error: {e}")
-                time.sleep(5)
-        threading.Thread(target=run_bot, daemon=True).start()
-
-        # اجرای وب‌سرور Flask روی پورت Render
+        # تنظیم Webhook در تلگرام
+        WEBHOOK_URL = f"https://{os.environ.get('RENDER_EXTERNAL_URL', 'your-service-name.onrender.com')}/webhook/{TOKEN}"
+        bot.set_webhook(url=WEBHOOK_URL)
+        
+        # اجرای وب‌سرور Flask برای دریافت پیام‌ها
         port = int(os.environ.get("PORT", 5000))
         app.run(host="0.0.0.0", port=port)
     else:

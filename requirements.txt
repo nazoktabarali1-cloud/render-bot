@@ -5,8 +5,5 @@ apscheduler
 yt-dlp
 requests
 requests-toolbelt
-psutil
 flask
 gunicorn
-telethon
-cryptg

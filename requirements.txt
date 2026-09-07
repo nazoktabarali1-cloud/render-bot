@@ -1,0 +1,9 @@
+python-telegram-bot
+yt-dlp
+requests
+requests-toolbelt
+psutil
+flask
+gunicorn
+telethon
+cryptg

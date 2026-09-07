@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
 # telegram_downloader_bot.py
-# نسخه هوشمند: اجرا هم روی لپ‌تاپ و هم روی Render (Webhook mode)
+# نسخه نهایی: Webhook Mode برای Render و Polling برای لپ‌تاپ
 # =====================================================================
 
 import os
@@ -71,9 +71,9 @@ TELETHON_SESSION = os.environ.get("TELETHON_SESSION", "user_session")
 
 FORCE_TELETHON_ALWAYS = os.environ.get("FORCE_TELETHON_ALWAYS", "0") == "1"
 
-# --- تشخیص محیط اجرا و تنظیم مسیر ذخیره‌سازی ---
-# اگر روی Render باشیم (متغیر PORT ست شده)، از پوشه موقت /tmp استفاده می‌کنیم
+# --- تشخیص محیط اجرا ---
 IS_ON_RENDER = bool(os.environ.get("PORT"))
+
 if IS_ON_RENDER:
     DOWNLOAD_ROOT = "/tmp/telegram_downloader"
 else:
@@ -92,7 +92,6 @@ BACKUP_ROOT = Path(DOWNLOAD_ROOT) / "telegram_bot_backups"
 BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
 BACKUP_LOCK = Lock()
 
-# --- تنظیم حداکثر دانلود همزمان ---
 if IS_ON_RENDER:
     MAX_CONCURRENT_DOWNLOADS = 2
 else:
@@ -242,7 +241,7 @@ def safe_edit_message(bot, chat_id, message_id, text, reply_markup=None):
             pass
 
 # -------------------------
-# === انیمیشن‌ها ===
+# انیمیشن‌ها
 # -------------------------
 
 def format_eta(seconds):
@@ -2068,6 +2067,8 @@ def main():
     bot = updater.bot
     dispatcher = updater.dispatcher
 
+    # تعریف هندلرها
+    dp = dispatcher
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("channel", handle_channel_cmd))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
@@ -2083,7 +2084,7 @@ def main():
 
     if IS_ON_RENDER:
         # تنظیم Webhook در تلگرام
-        WEBHOOK_URL = f"https://{os.environ.get('RENDER_EXTERNAL_URL', 'your-service-name.onrender.com')}/webhook/{TOKEN}"
+        WEBHOOK_URL = f"https://{os.environ.get('RENDER_EXTERNAL_URL', 'render-bot-87no.onrender.com')}/webhook/{TOKEN}"
         bot.set_webhook(url=WEBHOOK_URL)
         
         # اجرای وب‌سرور Flask برای دریافت پیام‌ها

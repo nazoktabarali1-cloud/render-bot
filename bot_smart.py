@@ -11,7 +11,6 @@ from telegram.ext import (
 )
 from pypdf import PdfReader, PdfWriter
 
-# تنظیم لاگ‌ها
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -19,15 +18,17 @@ PORT = int(os.environ.get("PORT", "8443"))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 MAX_FILE_SIZE_MB = 10
 
-# ---------------- توابع همگام (برای اجرا در Thread جداگانه و جلوگیری از فریز شدن) ----------------
+# تابع آپدیت نمودار پیشرفت
+async def update_progress(query, current, total, action_name="پردازش"):
+    percentage = int((current / total) * 100) if total > 0 else 0
+    filled = int(percentage / 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    try:
+        await query.edit_message_text(f"{action_name}...\n\n📊 پیشرفت: [{bar}] {percentage}%")
+    except Exception:
+        pass # جلوگیری از خطای Rate Limit تلگرام
 
-def process_extract_text(file_bytes):
-    reader = PdfReader(io.BytesIO(file_bytes))
-    text = "".join([f"--- صفحه {i+1} ---\n{p.extract_text() or ''}\n\n" for i, p in enumerate(reader.pages)])
-    output = io.BytesIO(text.encode('utf-8'))
-    output.name = "extracted_text.txt"
-    return output
-
+# توابع همگام (برای عملیات‌هایی که نیازی به پیشرفت ندارند و سریع هستند)
 def process_to_word(file_bytes):
     doc = Document()
     for page in PdfReader(io.BytesIO(file_bytes)).pages:
@@ -45,34 +46,6 @@ def process_compress(file_bytes):
     pdf_doc.save(output, garbage=4, deflate=True, clean=True)
     output.seek(0)
     output.name = "compressed.pdf"
-    return output
-
-def process_to_image(file_bytes):
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
-    images = []
-    for i in range(min(5, len(pdf_doc))): # محدودیت ۵ صفحه
-        pix = pdf_doc[i].get_pixmap(dpi=100)
-        images.append(pix.tobytes("png"))
-    return images
-
-def process_add_numbers(file_bytes):
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
-    for i, page in enumerate(pdf_doc):
-        page.insert_text((page.rect.width / 2, page.rect.height - 20), f"{i+1}", fontsize=12)
-    output = io.BytesIO()
-    pdf_doc.save(output)
-    output.seek(0)
-    output.name = "numbered.pdf"
-    return output
-
-def process_watermark(file_bytes, text):
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
-    for i in range(min(10, len(pdf_doc))): # محدودیت ۱۰ صفحه
-        pdf_doc[i].insert_text((50, 50), text, fontsize=30, color=(1, 0, 0), rotate=45)
-    output = io.BytesIO()
-    pdf_doc.save(output)
-    output.seek(0)
-    output.name = "watermarked.pdf"
     return output
 
 def process_add_cover(file_bytes, text):
@@ -98,7 +71,7 @@ def process_add_logo(file_bytes, img_bytes):
     output.name = "with_logo.pdf"
     return output
 
-# ---------------- هندلرهای Async ----------------
+# ---------------- هندلرها ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['files'] = []
@@ -156,35 +129,64 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_bytes = context.user_data['files'][0]
 
     try:
-        # ---- عملیات‌های سنگین (با Thread جداگانه برای جلوگیری از فریز شدن) ----
+        # ---- عملیات‌هایی که پیشرفت را نشان می‌دهند (صفحه به صفحه) ----
         if action == 'extract_text':
-            await query.edit_message_text("در حال استخراج متن... ⏳")
-            output = await asyncio.to_thread(process_extract_text, file_bytes)
+            reader = PdfReader(io.BytesIO(file_bytes))
+            total_pages = len(reader.pages)
+            text = ""
+            for i, page in enumerate(reader.pages):
+                text += f"--- صفحه {i+1} ---\n{page.extract_text() or ''}\n\n"
+                
+                # آپدیت پیشرفت هر ۱۰ درصد
+                if (i + 1) % max(1, total_pages // 10) == 0 or (i + 1) == total_pages:
+                    await update_progress(query, i+1, total_pages, "در حال استخراج متن")
+                    await asyncio.sleep(0.2) # استراحت به ربات
+            
+            if not text.strip():
+                await query.edit_message_text("❌ متنی پیدا نشد (فایل ممکن است عکس باشد).")
+                return
+            output = io.BytesIO(text.encode('utf-8'))
+            output.name = "extracted_text.txt"
             await context.bot.send_document(chat_id=user_id, document=output)
             await query.message.delete()
 
+        elif action == 'to_image':
+            pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+            total_pages = min(5, len(pdf_doc))
+            for i in range(total_pages):
+                await update_progress(query, i+1, total_pages, "در حال تبدیل به عکس")
+                pix = pdf_doc[i].get_pixmap(dpi=100)
+                await context.bot.send_photo(chat_id=user_id, photo=pix.tobytes("png"), caption=f"صفحه {i+1}")
+                await asyncio.sleep(0.2)
+            await query.message.delete()
+
+        elif action == 'add_numbers':
+            await query.edit_message_text("در حال شماره‌گذاری صفحات... ⏳")
+            pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+            total_pages = len(pdf_doc)
+            for i, page in enumerate(pdf_doc):
+                page.insert_text((page.rect.width / 2, page.rect.height - 20), f"{i+1}", fontsize=12)
+                if (i + 1) % max(1, total_pages // 10) == 0:
+                    await update_progress(query, i+1, total_pages, "در حال شماره‌گذاری")
+                    await asyncio.sleep(0.1)
+            
+            output = io.BytesIO()
+            pdf_doc.save(output)
+            output.seek(0)
+            output.name = "numbered.pdf"
+            await context.bot.send_document(chat_id=user_id, document=output)
+            await query.message.delete()
+
+        # ---- عملیات‌هایی که در پس‌زمینه پردازش می‌شوند (بدون پیشرفت صفحه‌ای) ----
         elif action == 'to_word':
             await query.edit_message_text("در حال تبدیل به Word... ⏳")
             output = await asyncio.to_thread(process_to_word, file_bytes)
             await context.bot.send_document(chat_id=user_id, document=output)
             await query.message.delete()
 
-        elif action == 'to_image':
-            await query.edit_message_text("در حال تبدیل به عکس... ⏳ (۵ صفحه اول)")
-            images = await asyncio.to_thread(process_to_image, file_bytes)
-            for i, img in enumerate(images):
-                await context.bot.send_photo(chat_id=user_id, photo=img, caption=f"صفحه {i+1}")
-            await query.message.delete()
-
         elif action == 'compress':
             await query.edit_message_text("در حال فشرده‌سازی... ⏳")
             output = await asyncio.to_thread(process_compress, file_bytes)
-            await context.bot.send_document(chat_id=user_id, document=output)
-            await query.message.delete()
-
-        elif action == 'add_numbers':
-            await query.edit_message_text("در حال شماره‌گذاری... ⏳")
-            output = await asyncio.to_thread(process_add_numbers, file_bytes)
             await context.bot.send_document(chat_id=user_id, document=output)
             await query.message.delete()
 
@@ -230,7 +232,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_document(chat_id=user_id, document=output)
             await query.message.delete()
 
-        # ---- عملیات‌های نیازمند دریافت متن/عکس از کاربر ----
+        # ---- عملیات‌های نیازمند ورودی ----
         elif action == 'watermark':
             await query.edit_message_text("💧 متن واترمارک را بفرستید:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data='cancel')]]))
             context.user_data['state'] = 'waiting_watermark'
@@ -330,7 +332,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.delete()
 
         elif state == 'waiting_watermark':
-            output = await asyncio.to_thread(process_watermark, file_bytes, text)
+            await msg.edit_text("در حال اعمال واترمارک... ⏳")
+            pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+            total_pages = min(10, len(pdf_doc))
+            for i in range(total_pages):
+                await update_progress(msg, i+1, total_pages, "در حال اعمال واترمارک")
+                pdf_doc[i].insert_text((50, 50), text, fontsize=30, color=(1, 0, 0), rotate=45)
+                await asyncio.sleep(0.1)
+            output = io.BytesIO()
+            pdf_doc.save(output)
+            output.seek(0)
+            output.name = "watermarked.pdf"
             await context.bot.send_document(chat_id=user_id, document=output)
             await msg.delete()
 
@@ -375,7 +387,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state'] = None
 
 def main():
-    # در اینجا تایم‌اوت‌ها به ۶۰ ثانیه افزایش یافته‌اند تا خطای TimedOut رخ ندهد
     application = (
         ApplicationBuilder()
         .token(TOKEN)

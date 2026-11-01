@@ -7,7 +7,7 @@ import datetime
 import fitz  # PyMuPDF
 import pdfplumber
 from docx import Document
-from deep_translator import GoogleTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler,
@@ -120,16 +120,50 @@ def p_translate(file_bytes):
     if not full_text.strip():
         return None, "متنی برای ترجمه نیست."
 
-    # بدون محدودیت طول - تکه‌تکه ترجمه می‌شود
-    chunks = [full_text[i:i+3000] for i in range(0, len(full_text), 3000)]
-    trans = GoogleTranslator(source='auto', target='en')
+    # MyMemory محدودیت حدود ۵۰۰ کاراکتر در هر درخواست دارد
+    chunks = [full_text[i:i+450] for i in range(0, len(full_text), 450)]
     results = []
-    for i, c in enumerate(chunks):
+    success_count = 0
+    fail_count = 0
+
+    for i, chunk in enumerate(chunks):
+        translated = None
+        # اول MyMemory را امتحان می‌کنیم (روی سرورهای ابری پایدارتر است)
         try:
-            results.append(trans.translate(c))
+            trans = MyMemoryTranslator(source='auto', target='en')
+            translated = trans.translate(chunk)
+            if translated and translated.strip() and not translated.startswith("QUERY LENGTH LIMIT"):
+                success_count += 1
+            else:
+                raise Exception("MyMemory limit or empty")
         except Exception:
-            results.append(f"[خطا در ترجمه بخش {i+1}]")
-    out = io.BytesIO("\n".join(results).encode('utf-8'))
+            # اگر MyMemory شکست خورد، Google را امتحان می‌کنیم
+            try:
+                trans = GoogleTranslator(source='auto', target='en')
+                translated = trans.translate(chunk)
+                if translated and translated.strip():
+                    success_count += 1
+                else:
+                    raise Exception("Empty result")
+            except Exception as e:
+                fail_count += 1
+                translated = f"[خطا در ترجمه بخش {i+1}]"
+
+        results.append(translated or f"[خطا در ترجمه بخش {i+1}]")
+
+        # کمی تأخیر برای جلوگیری از rate-limit
+        if i < len(chunks) - 1 and i % 5 == 4:
+            import time
+            time.sleep(0.8)
+
+    header = (
+        f"=== نتیجه ترجمه (MyMemory + Google) ===\n"
+        f"موفق: {success_count} | ناموفق: {fail_count} | کل بخش‌ها: {len(chunks)}\n\n"
+    )
+    if fail_count == len(chunks):
+        header += "⚠️ هر دو سرویس ترجمه با خطا مواجه شدند.\n\n"
+
+    out = io.BytesIO((header + "\n\n".join(results)).encode('utf-8'))
     out.name = "translated.txt"
     return out, None
 

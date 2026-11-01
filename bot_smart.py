@@ -29,8 +29,22 @@ MAX_PAGES_HEAVY = 300   # محدودیت برای عملیات سنگین (grays
 
 # ==================== توابع پردازش (Sync) ====================
 
-def p_extract_text(file_bytes):
+def _open_reader(file_bytes):
+    """باز کردن PDF با پیام خطای واضح اگر رمزدار باشد"""
     reader = PdfReader(io.BytesIO(file_bytes))
+    if reader.is_encrypted:
+        # سعی می‌کنیم بدون رمز باز کنیم (بعضی فایل‌ها فقط owner password دارند)
+        try:
+            result = reader.decrypt("")
+            if result == 0:
+                raise ValueError("این فایل رمزدار است. ابتدا با دکمه «باز کردن قفل» رمز را وارد کنید.")
+        except Exception:
+            raise ValueError("این فایل رمزدار است. ابتدا با دکمه «باز کردن قفل» رمز را وارد کنید.")
+    return reader
+
+
+def p_extract_text(file_bytes):
+    reader = _open_reader(file_bytes)
     text = "".join(
         [f"--- صفحه {i+1} ---\n{p.extract_text() or ''}\n\n" for i, p in enumerate(reader.pages)]
     )
@@ -91,7 +105,7 @@ def p_extract_images(file_bytes):
 
 
 def p_to_markdown(file_bytes):
-    reader = PdfReader(io.BytesIO(file_bytes))
+    reader = _open_reader(file_bytes)
     md_text = ""
     for i, page in enumerate(reader.pages):
         md_text += f"# صفحه {i+1}\n\n{page.extract_text() or ''}\n\n"
@@ -101,31 +115,29 @@ def p_to_markdown(file_bytes):
 
 
 def p_translate(file_bytes):
-    reader = PdfReader(io.BytesIO(file_bytes))
+    reader = _open_reader(file_bytes)
     full_text = "".join([p.extract_text() or "" for p in reader.pages])
     if not full_text.strip():
         return None, "متنی برای ترجمه نیست."
 
-    # محدودیت طول برای جلوگیری از timeout روی Render
-    if len(full_text) > 30000:
-        return None, "متن خیلی طولانی است (حداکثر حدود ۳۰ هزار کاراکتر)."
-
-    chunks = [full_text[i:i+3500] for i in range(0, len(full_text), 3500)]
+    # بدون محدودیت طول - تکه‌تکه ترجمه می‌شود
+    chunks = [full_text[i:i+3000] for i in range(0, len(full_text), 3000)]
     trans = GoogleTranslator(source='auto', target='en')
     results = []
-    for c in chunks:
+    for i, c in enumerate(chunks):
         try:
             results.append(trans.translate(c))
         except Exception:
-            results.append("[خطا در ترجمه این بخش]")
+            results.append(f"[خطا در ترجمه بخش {i+1}]")
     out = io.BytesIO("\n".join(results).encode('utf-8'))
     out.name = "translated.txt"
     return out, None
 
 
 def p_to_word(file_bytes):
+    reader = _open_reader(file_bytes)
     doc = Document()
-    for page in PdfReader(io.BytesIO(file_bytes)).pages:
+    for page in reader.pages:
         doc.add_paragraph(page.extract_text() or "")
         doc.add_page_break()
     out = io.BytesIO()
@@ -136,7 +148,7 @@ def p_to_word(file_bytes):
 
 
 def p_split_single(file_bytes):
-    reader = PdfReader(io.BytesIO(file_bytes))
+    reader = _open_reader(file_bytes)
     if len(reader.pages) > MAX_PAGES_HEAVY:
         return None, f"برای جلوگیری از فشار به سرور، حداکثر {MAX_PAGES_HEAVY} صفحه مجاز است."
     zip_buffer = io.BytesIO()
@@ -153,7 +165,7 @@ def p_split_single(file_bytes):
 
 
 def p_keep_first_page(file_bytes):
-    reader = PdfReader(io.BytesIO(file_bytes))
+    reader = _open_reader(file_bytes)
     writer = PdfWriter()
     if reader.pages:
         writer.add_page(reader.pages[0])
@@ -181,8 +193,9 @@ def p_merge(files_list):
 
 
 def p_reverse(file_bytes):
+    reader = _open_reader(file_bytes)
     writer = PdfWriter()
-    for page in reversed(PdfReader(io.BytesIO(file_bytes)).pages):
+    for page in reversed(reader.pages):
         writer.add_page(page)
     out = io.BytesIO()
     writer.write(out)
@@ -192,8 +205,9 @@ def p_reverse(file_bytes):
 
 
 def p_rotate(file_bytes, angle=90):
+    reader = _open_reader(file_bytes)
     writer = PdfWriter()
-    for page in PdfReader(io.BytesIO(file_bytes)).pages:
+    for page in reader.pages:
         page.rotate(angle)
         writer.add_page(page)
     out = io.BytesIO()
@@ -204,11 +218,19 @@ def p_rotate(file_bytes, angle=90):
 
 
 def p_insert_blank(file_bytes, page_num):
-    reader = PdfReader(io.BytesIO(file_bytes))
+    """بعد از صفحه page_num یک صفحه خالی درج می‌کند. page_num=0 یعنی اول فایل."""
+    reader = _open_reader(file_bytes)
     writer = PdfWriter()
     total = len(reader.pages)
     if page_num < 0 or page_num > total:
-        raise ValueError(f"شماره صفحه باید بین ۰ تا {total} باشد.")
+        raise ValueError(f"شماره صفحه باید بین ۰ تا {total} باشد. (۰ = اول فایل)")
+    # اگر page_num == 0 باشد، اول صفحه خالی می‌گذاریم
+    if page_num == 0:
+        if total > 0:
+            first = reader.pages[0]
+            writer.add_blank_page(width=first.mediabox.width, height=first.mediabox.height)
+        else:
+            writer.add_blank_page()
     for i, page in enumerate(reader.pages):
         writer.add_page(page)
         if i + 1 == page_num:
@@ -221,7 +243,7 @@ def p_insert_blank(file_bytes, page_num):
 
 
 def p_move_page_to_end(file_bytes, page_num):
-    reader = PdfReader(io.BytesIO(file_bytes))
+    reader = _open_reader(file_bytes)
     total = len(reader.pages)
     if page_num < 1 or page_num > total:
         raise ValueError(f"شماره صفحه باید بین ۱ تا {total} باشد.")
@@ -259,7 +281,7 @@ def p_highlight(file_bytes, text):
 
 def p_find_replace(file_bytes, old_text, new_text):
     """جایگزینی متن و برگرداندن فایل متنی (چون جایگزینی واقعی در PDF پیچیده و غیرقابل‌اعتماد است)"""
-    reader = PdfReader(io.BytesIO(file_bytes))
+    reader = _open_reader(file_bytes)
     full_text = "".join([p.extract_text() or "" for p in reader.pages])
     new_full_text = full_text.replace(old_text, new_text)
     out = io.BytesIO(new_full_text.encode('utf-8'))
@@ -268,7 +290,7 @@ def p_find_replace(file_bytes, old_text, new_text):
 
 
 def p_clear_metadata(file_bytes):
-    reader = PdfReader(io.BytesIO(file_bytes))
+    reader = _open_reader(file_bytes)
     writer = PdfWriter()
     for page in reader.pages:
         writer.add_page(page)
@@ -281,7 +303,7 @@ def p_clear_metadata(file_bytes):
 
 
 def p_restrict_print(file_bytes):
-    reader = PdfReader(io.BytesIO(file_bytes))
+    reader = _open_reader(file_bytes)
     writer = PdfWriter()
     for page in reader.pages:
         writer.add_page(page)
@@ -305,9 +327,10 @@ def p_compress(file_bytes):
 
 
 def p_resize_a4(file_bytes):
-    reader = PdfReader(io.BytesIO(file_bytes))
+    reader = _open_reader(file_bytes)
     writer = PdfWriter()
     for page in reader.pages:
+        # scale_to نسبت تصویر را حفظ نمی‌کند؛ برای سازگاری ساده نگه داشته شده
         page.scale_to(width=595, height=842)  # A4
         writer.add_page(page)
     out = io.BytesIO()
@@ -370,14 +393,13 @@ def p_watermark(file_bytes, text):
         pdf_doc.close()
         return None, f"حداکثر {MAX_PAGES_HEAVY} صفحه برای واترمارک مجاز است."
     for page in pdf_doc:
-        # واترمارک در مرکز صفحه با چرخش
+        # واترمارک در مرکز صفحه با چرخش (سازگار با PyMuPDF قدیمی)
         page.insert_text(
-            (page.rect.width / 2 - 100, page.rect.height / 2),
+            (page.rect.width / 2 - 80, page.rect.height / 2),
             text,
-            fontsize=36,
-            color=(1, 0, 0),
-            rotate=45,
-            opacity=0.3
+            fontsize=32,
+            color=(0.85, 0.1, 0.1),   # قرمز کم‌رنگ
+            rotate=45
         )
     out = io.BytesIO()
     pdf_doc.save(out)
@@ -417,8 +439,8 @@ def p_add_logo(file_bytes, img_bytes):
 
 
 def p_encrypt(file_bytes, password):
+    reader = _open_reader(file_bytes)
     writer = PdfWriter()
-    reader = PdfReader(io.BytesIO(file_bytes))
     for page in reader.pages:
         writer.add_page(page)
     writer.encrypt(user_password=password, owner_password=password + "_owner")
@@ -446,7 +468,7 @@ def p_decrypt(file_bytes, password):
 
 
 def p_delete_pages(file_bytes, page_numbers):
-    reader = PdfReader(io.BytesIO(file_bytes))
+    reader = _open_reader(file_bytes)
     writer = PdfWriter()
     total = len(reader.pages)
     pages_to_delete = set()
@@ -463,6 +485,41 @@ def p_delete_pages(file_bytes, page_numbers):
     out.seek(0)
     out.name = "deleted_pages.pdf"
     return out
+
+
+def p_extract_range(file_bytes, start_page, end_page):
+    """استخراج محدوده صفحات (مثلاً از صفحه ۵ تا ۱۲)"""
+    reader = _open_reader(file_bytes)
+    total = len(reader.pages)
+    if start_page < 1 or end_page > total or start_page > end_page:
+        raise ValueError(f"محدوده نامعتبر است. فایل {total} صفحه دارد.")
+    writer = PdfWriter()
+    for i in range(start_page - 1, end_page):
+        writer.add_page(reader.pages[i])
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+    out.name = f"pages_{start_page}_to_{end_page}.pdf"
+    return out
+
+
+def p_to_images(file_bytes):
+    """تبدیل هر صفحه PDF به تصویر JPEG و قرار دادن در ZIP"""
+    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    if len(pdf_doc) > MAX_PAGES_HEAVY:
+        pdf_doc.close()
+        return None, f"حداکثر {MAX_PAGES_HEAVY} صفحه برای تبدیل به تصویر مجاز است."
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for i, page in enumerate(pdf_doc):
+            # رزولوشن مناسب برای کیفیت خوب
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            img_bytes = pix.tobytes("jpeg")
+            zf.writestr(f"page_{i+1:03d}.jpg", img_bytes)
+    pdf_doc.close()
+    zip_buffer.seek(0)
+    zip_buffer.name = "pages_as_images.zip"
+    return zip_buffer, None
 
 
 # ==================== توابع کمکی ربات ====================
@@ -517,6 +574,8 @@ def get_main_keyboard():
         [InlineKeyboardButton("🚫 جلوگیری از پرینت", callback_data='restrict_print'),
          InlineKeyboardButton("🖼️ افزودن کاور", callback_data='add_cover')],
         [InlineKeyboardButton("🏷️ افزودن لوگو", callback_data='add_logo'),
+         InlineKeyboardButton("📑 استخراج محدوده", callback_data='extract_range')],
+        [InlineKeyboardButton("🖼️ PDF به عکس (ZIP)", callback_data='to_images'),
          InlineKeyboardButton("♻️ پاک کردن فایل‌ها", callback_data='clear_files')]
     ]
 
@@ -639,8 +698,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("⚠️ برای ادغام باید حداقل دو فایل فرستاده باشید.")
                 return
             out = await run_bg(query, p_merge, context.user_data['files'], action_name="ادغام")
+        elif action == 'to_images':
+            result = await run_bg(query, p_to_images, file_bytes, action_name="تبدیل به عکس")
+            if isinstance(result, tuple):
+                out, err = result
+            else:
+                out = result
 
         # عملیات‌های نیازمند ورودی
+        elif action == 'extract_range':
+            await query.edit_message_text(
+                "📑 محدوده صفحات را به این شکل بفرستید:\nمثال: 5-12\nیا فقط یک صفحه: 7",
+                reply_markup=get_cancel_btn()
+            )
+            context.user_data['state'] = 'waiting_extract_range'
+            return
         elif action == 'encrypt':
             await query.edit_message_text("🔑 رمز عبور دلخواه را بفرستید:", reply_markup=get_cancel_btn())
             context.user_data['state'] = 'waiting_password'
@@ -784,6 +856,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif state == 'waiting_cover':
             out = await asyncio.to_thread(p_add_cover, file_bytes, text)
+
+        elif state == 'waiting_extract_range':
+            try:
+                text = text.replace(" ", "")
+                if "-" in text:
+                    parts = text.split("-")
+                    start_page = int(parts[0])
+                    end_page = int(parts[1])
+                else:
+                    start_page = end_page = int(text)
+                out = await asyncio.to_thread(p_extract_range, file_bytes, start_page, end_page)
+            except ValueError as ve:
+                err = str(ve)
+            except Exception:
+                err = "فرمت اشتباه است. مثال صحیح: 5-12 یا فقط 7"
 
         if err:
             await msg.edit_text(f"❌ {err}")

@@ -2,7 +2,7 @@ import os
 import logging
 import io
 import time
-import fitz  # این همان PyMuPDF است
+import fitz  # PyMuPDF
 from docx import Document
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -11,25 +11,24 @@ from telegram.ext import (
 )
 from pypdf import PdfReader, PdfWriter
 
+# تنظیم لاگ‌ها برای دیدن خطاها در Render
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
+# خواندن متغیرهای محیطی از Render
 TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get("PORT", "8443"))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
-# حالت‌های مکالمه
+# حالت‌های مکالمه (State Machine)
 WAITING_FOR_PASSWORD, WAITING_FOR_PAGES, WAITING_FOR_WATERMARK, WAITING_FOR_SPLIT = range(4)
 
-# دیکشنری برای نگه داری فایل‌ها
-# ساختار: user_files[user_id] = {"files": [bytes], "action": str, "timestamp": float}
+# دیکشنری برای نگه داری فایل‌ها در حافظه
 user_files = {}
 MAX_FILE_SIZE_MB = 10
-TIME_LIMIT = 300 # ۵ دقیقه
-
-def check_size(size):
-    return size < MAX_FILE_SIZE_MB * 1024 * 1024
+TIME_LIMIT = 300 # ۵ دقیقه (ثانیه)
 
 def cleanup_old_files():
+    """پاک کردن فایل‌های کاربرانی که بیش از ۵ دقیقه در حافظه مانده‌اند"""
     now = time.time()
     for uid in list(user_files.keys()):
         if now - user_files[uid].get("timestamp", 0) > TIME_LIMIT:
@@ -37,6 +36,10 @@ def cleanup_old_files():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cleanup_old_files()
+    user_id = update.effective_user.id
+    if user_id in user_files:
+        del user_files[user_id] # پاک کردن حافظه با استارت جدید
+    
     await update.message.reply_text(
         "سلام! به دستیار جامع PDF خوش آمدید. 📄\n"
         "⚠️ حداکثر حجم مجاز فایل: ۱۰ مگابایت.\n"
@@ -48,23 +51,23 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     doc = update.message.document
     
+    # چک کردن حجم فایل
     if doc.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
         await update.message.reply_text(f"❌ حجم فایل بیشتر از {MAX_FILE_SIZE_MB} مگابایت است. برای جلوگیری از کرش سرور، فایل کوچکتری بفرستید.")
         return
 
+    # دانلود فایل
     pdf_file = await doc.get_file()
     file_bytes = await pdf_file.download_as_bytearray()
     
+    # ذخیره در دیکشنری
     if user_id not in user_files:
         user_files[user_id] = {"files": [], "action": None}
         
     user_files[user_id]["files"].append(file_bytes)
     user_files[user_id]["timestamp"] = time.time()
 
-    if len(user_files[user_id]["files"]) > 1:
-        await update.message.reply_text(f"فایل {len(user_files[user_id]['files'])} دریافت شد. فایل بعدی را بفرستید یا یک عملیات را انتخاب کنید.")
-        return
-
+    # ساخت منوی دکمه‌ها (حالا با هر بار ارسال فایل نشان داده می‌شود)
     keyboard = [
         [InlineKeyboardButton("📝 استخراج متن", callback_data='extract_text'), InlineKeyboardButton("📄 خروجی Word", callback_data='to_word')],
         [InlineKeyboardButton("🖼️ تبدیل به عکس", callback_data='to_image'), InlineKeyboardButton("🔄 چرخش ۹۰ درجه", callback_data='rotate_90')],
@@ -72,7 +75,15 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✂️ استخراج صفحات", callback_data='split_pages'), InlineKeyboardButton("🔗 ادغام فایل‌ها", callback_data='merge')],
         [InlineKeyboardButton("💧 واترمارک متنی", callback_data='watermark')]
     ]
-    await update.message.reply_text("فایل دریافت شد! چه کاری می‌خواهی انجام دهم؟", reply_markup=InlineKeyboardMarkup(keyboard))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    count = len(user_files[user_id]["files"])
+    if count == 1:
+        msg = "فایل دریافت شد! چه کاری می‌خواهی انجام دهم؟"
+    else:
+        msg = f"فایل {count} دریافت شد. می‌توانید فایل بعدی را بفرستید یا یک عملیات را انتخاب کنید."
+        
+    await update.message.reply_text(msg, reply_markup=reply_markup)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -104,7 +115,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("در حال استخراج متن... ⏳")
         text = "".join([f"--- صفحه {i+1} ---\n{p.extract_text() or ''}\n\n" for i, p in enumerate(reader.pages)])
         if not text.strip():
-            await query.edit_message_text("❌ متنی پیدا نشد (PDF تصویری است).")
+            await query.edit_message_text("❌ متنی پیدا نشد (PDF ممکن است تصویری باشد).")
             return ConversationHandler.END
         output = io.BytesIO(text.encode('utf-8'))
         output.name = "extracted_text.txt"
@@ -112,7 +123,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.delete()
 
     elif query.data == 'to_word':
-        await query.edit_message_text("در حال تبدیل به Word... ⏳ (ممکن است کمی طول بکشد)")
+        await query.edit_message_text("در حال تبدیل به Word... ⏳")
         doc = Document()
         for page in reader.pages:
             doc.add_paragraph(page.extract_text() or "")
@@ -128,9 +139,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("در حال تبدیل به تصویر... ⏳ (فقط ۳ صفحه اول برای جلوگیری از فشار به سرور)")
         try:
             pdf_doc = fitz.open(stream=user_files[user_id]["files"][0], filetype="pdf")
-            for i in range(min(3, len(pdf_doc))): # فقط ۳ صفحه اول
+            for i in range(min(3, len(pdf_doc))): # محدودیت ۳ صفحه
                 page = pdf_doc[i]
-                pix = page.get_pixmap(dpi=100) # کاهش کیفیت برای حجم کمتر
+                pix = page.get_pixmap(dpi=100)
                 img_bytes = pix.tobytes("png")
                 await context.bot.send_photo(chat_id=user_id, photo=img_bytes, caption=f"صفحه {i+1}")
             await query.message.delete()
@@ -170,6 +181,7 @@ async def receive_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         writer.add_page(page)
     writer.encrypt(user_password=update.message.text, owner_password="admin_owner_pass")
     await send_pdf(update, writer, "encrypted.pdf", is_msg=True)
+    del user_files[user_id]
     return ConversationHandler.END
 
 async def receive_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -187,6 +199,7 @@ async def receive_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if (i + 1) not in pages:
             writer.add_page(page)
     await send_pdf(update, writer, "deleted.pdf", is_msg=True)
+    del user_files[user_id]
     return ConversationHandler.END
 
 async def receive_split(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -204,6 +217,7 @@ async def receive_split(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i in range(start-1, min(end, len(reader.pages))):
         writer.add_page(reader.pages[i])
     await send_pdf(update, writer, "splitted.pdf", is_msg=True)
+    del user_files[user_id]
     return ConversationHandler.END
 
 async def receive_watermark(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -216,7 +230,6 @@ async def receive_watermark(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
         for i in range(min(5, len(pdf_doc))):
             page = pdf_doc[i]
-            # قرار دادن متن در گوشه صفحه
             page.insert_text((50, 50), watermark_text, fontsize=30, color=(1, 0, 0), rotate=45)
             
         output = io.BytesIO()
@@ -226,6 +239,8 @@ async def receive_watermark(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(chat_id=user_id, document=output)
     except Exception as e:
         await update.message.reply_text(f"❌ خطا: {str(e)}")
+    
+    del user_files[user_id]
     return ConversationHandler.END
 
 async def send_pdf(update, writer, filename, is_msg=False):

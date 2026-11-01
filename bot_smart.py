@@ -11,6 +11,7 @@ from telegram.ext import (
 )
 from pypdf import PdfReader, PdfWriter
 
+# تنظیم لاگ‌ها
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -18,7 +19,8 @@ PORT = int(os.environ.get("PORT", "8443"))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 MAX_FILE_SIZE_MB = 10
 
-# ---------------- توابع همگام برای پردازش‌های سنگین (در Thread جداگانه اجرا می‌شوند) ----------------
+# ---------------- توابع همگام (برای اجرا در Thread جداگانه و جلوگیری از فریز شدن) ----------------
+
 def process_extract_text(file_bytes):
     reader = PdfReader(io.BytesIO(file_bytes))
     text = "".join([f"--- صفحه {i+1} ---\n{p.extract_text() or ''}\n\n" for i, p in enumerate(reader.pages)])
@@ -48,7 +50,7 @@ def process_compress(file_bytes):
 def process_to_image(file_bytes):
     pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
     images = []
-    for i in range(min(5, len(pdf_doc))):
+    for i in range(min(5, len(pdf_doc))): # محدودیت ۵ صفحه
         pix = pdf_doc[i].get_pixmap(dpi=100)
         images.append(pix.tobytes("png"))
     return images
@@ -116,8 +118,8 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'files' not in context.user_data:
         context.user_data['files'] = []
         
-    pdf_file = await doc.get_file() # <--- اینجا await اصلاح شد
-    file_bytes = await pdf_file.download_as_bytearray() # <--- و اینجا
+    pdf_file = await doc.get_file()
+    file_bytes = await pdf_file.download_as_bytearray()
     context.user_data['files'].append(file_bytes)
     context.user_data['state'] = None
 
@@ -147,14 +149,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if 'files' not in context.user_data or not context.user_data['files']:
-        await query.edit_message_text("❌ فایل شما منقضی شده است.")
+        await query.edit_message_text("❌ فایل شما منقضی شده است. لطفاً دوباره PDF را بفرستید.")
         return
 
     action = query.data
     file_bytes = context.user_data['files'][0]
 
     try:
-        # ---- عملیات‌های با Thread جداگانه (بدون فریز شدن) ----
+        # ---- عملیات‌های سنگین (با Thread جداگانه برای جلوگیری از فریز شدن) ----
         if action == 'extract_text':
             await query.edit_message_text("در حال استخراج متن... ⏳")
             output = await asyncio.to_thread(process_extract_text, file_bytes)
@@ -228,7 +230,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_document(chat_id=user_id, document=output)
             await query.message.delete()
 
-        # ---- عملیات‌های نیازمند ورودی ----
+        # ---- عملیات‌های نیازمند دریافت متن/عکس از کاربر ----
         elif action == 'watermark':
             await query.edit_message_text("💧 متن واترمارک را بفرستید:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data='cancel')]]))
             context.user_data['state'] = 'waiting_watermark'
@@ -373,8 +375,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state'] = None
 
 def main():
-    # چون از asyncio.to_thread استفاده کردیم، دیگر نیازی به concurrent_updates نیست و ربات فریز نمی‌شود
-    application = ApplicationBuilder().token(TOKEN).build()
+    # در اینجا تایم‌اوت‌ها به ۶۰ ثانیه افزایش یافته‌اند تا خطای TimedOut رخ ندهد
+    application = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .connect_timeout(60.0)
+        .read_timeout(60.0)
+        .write_timeout(60.0)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))

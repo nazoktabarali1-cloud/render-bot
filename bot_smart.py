@@ -3,7 +3,9 @@ import logging
 import io
 import asyncio
 import fitz  # PyMuPDF
+import pdfplumber
 from docx import Document
+from deep_translator import GoogleTranslator
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, 
@@ -18,7 +20,7 @@ PORT = int(os.environ.get("PORT", "8443"))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 MAX_FILE_SIZE_MB = 10
 
-# ---------------- توابع پردازش سنگین (Sync) برای اجرا در Thread ----------------
+# ---------------- توابع پردازش سنگین (Sync) ----------------
 
 def process_extract_text(file_bytes):
     reader = PdfReader(io.BytesIO(file_bytes))
@@ -26,6 +28,50 @@ def process_extract_text(file_bytes):
     output = io.BytesIO(text.encode('utf-8'))
     output.name = "extracted_text.txt"
     return output
+
+def process_extract_tables(file_bytes):
+    # استخراج جدول با pdfplumber
+    tables_text = ""
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for i, page in enumerate(pdf.pages):
+            tables = page.extract_tables()
+            if tables:
+                tables_text += f"--- جدول‌های صفحه {i+1} ---\n"
+                for table in tables:
+                    for row in table:
+                        tables_text += " | ".join([str(cell) if cell else "" for cell in row]) + "\n"
+                    tables_text += "\n"
+    if not tables_text.strip():
+        return None, "❌ هیچ جدولی در این PDF پیدا نشد."
+    output = io.BytesIO(tables_text.encode('utf-8'))
+    output.name = "tables.txt"
+    return output, None
+
+def process_translate(file_bytes, target_lang='en'):
+    reader = PdfReader(io.BytesIO(file_bytes))
+    full_text = ""
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            full_text += text + "\n"
+    
+    if not full_text.strip():
+        return None, "❌ متنی برای ترجمه پیدا نشد (احتمالاً PDF تصویری است)."
+    
+    max_chunk = 4000
+    chunks = [full_text[i:i+max_chunk] for i in range(0, len(full_text), max_chunk)]
+    translated_chunks = []
+    translator = GoogleTranslator(source='auto', target=target_lang)
+    
+    for chunk in chunks:
+        try:
+            translated_chunks.append(translator.translate(chunk))
+        except Exception as e:
+            translated_chunks.append(f"[خطا در ترجمه بخشی از متن]")
+    
+    output = io.BytesIO("\n".join(translated_chunks).encode('utf-8'))
+    output.name = f"translated_{target_lang}.txt"
+    return output, None
 
 def process_to_word(file_bytes):
     doc = Document()
@@ -89,7 +135,7 @@ def process_add_logo(file_bytes, img_bytes):
     output.name = "with_logo.pdf"
     return output
 
-# ---------------- توابع کمکی برای نوار پیشرفت ----------------
+# ---------------- توابع نوار پیشرفت و اجرای پس‌زمینه ----------------
 
 async def update_progress(query, current, total, action_name="پردازش"):
     percentage = int((current / total) * 100) if total > 0 else 0
@@ -100,14 +146,13 @@ async def update_progress(query, current, total, action_name="پردازش"):
     except Exception:
         pass
 
-async def run_with_fake_progress(query, coro, action_name="پردازش"):
-    """اجرای عملیات در پس‌زمینه و نمایش همزمان پیشرفت بدون فریز شدن"""
+async def run_with_progress(query, coro, action_name="پردازش"):
     task = asyncio.create_task(coro)
     for i in range(1, 11):
         if task.done():
             break
         await update_progress(query, i, 10, action_name)
-        await asyncio.sleep(0.5) # هر نیم ثانیه آپدیت می‌شود
+        await asyncio.sleep(0.5)
     return await task
 
 # ---------------- هندلرها ----------------
@@ -135,8 +180,10 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['files'].append(file_bytes)
     context.user_data['state'] = None
 
+    # منوی جدید با دکمه‌های ترجمه، جدول و OCR
     keyboard = [
-        [InlineKeyboardButton("📝 استخراج متن", callback_data='extract_text'), InlineKeyboardButton("📄 خروجی Word", callback_data='to_word')],
+        [InlineKeyboardButton("📝 استخراج متن", callback_data='extract_text'), InlineKeyboardButton("📊 استخراج جدول", callback_data='extract_tables')],
+        [InlineKeyboardButton("🌐 ترجمه به انگلیسی", callback_data='translate_en'), InlineKeyboardButton("📄 خروجی Word", callback_data='to_word')],
         [InlineKeyboardButton("🖼️ تبدیل به عکس", callback_data='to_image'), InlineKeyboardButton("🔇 فشرده‌سازی", callback_data='compress')],
         [InlineKeyboardButton("🔒 رمزگذاری", callback_data='encrypt'), InlineKeyboardButton("🔓 باز کردن قفل", callback_data='decrypt')],
         [InlineKeyboardButton("🗑️ حذف صفحات", callback_data='delete_pages'), InlineKeyboardButton("✂️ استخراج صفحات", callback_data='split_pages')],
@@ -168,24 +215,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_bytes = context.user_data['files'][0]
 
     try:
-        # ---- عملیات‌هایی که در پس‌زمینه اجرا می‌شوند ----
-        if action == 'extract_text':
-            output = await run_with_fake_progress(query, asyncio.to_thread(process_extract_text, file_bytes), "در حال استخراج متن")
+        # ---- عملیات‌های اضافه شده ----
+        if action == 'extract_tables':
+            output, error = await run_with_progress(query, asyncio.to_thread(process_extract_tables, file_bytes), "در حال استخراج جدول‌ها")
+            if error:
+                await query.edit_message_text(error)
+            else:
+                await context.bot.send_document(chat_id=user_id, document=output)
+                await query.message.delete()
+
+        elif action == 'translate_en':
+            output, error = await run_with_progress(query, asyncio.to_thread(process_translate, file_bytes, 'en'), "در حال ترجمه به انگلیسی")
+            if error:
+                await query.edit_message_text(error)
+            else:
+                await context.bot.send_document(chat_id=user_id, document=output)
+                await query.message.delete()
+
+        # ---- عملیات‌های قبلی ----
+        elif action == 'extract_text':
+            output = await run_with_progress(query, asyncio.to_thread(process_extract_text, file_bytes), "در حال استخراج متن")
             await context.bot.send_document(chat_id=user_id, document=output)
             await query.message.delete()
 
         elif action == 'to_word':
-            output = await run_with_fake_progress(query, asyncio.to_thread(process_to_word, file_bytes), "در حال تبدیل به Word")
+            output = await run_with_progress(query, asyncio.to_thread(process_to_word, file_bytes), "در حال تبدیل به Word")
             await context.bot.send_document(chat_id=user_id, document=output)
             await query.message.delete()
 
         elif action == 'compress':
-            output = await run_with_fake_progress(query, asyncio.to_thread(process_compress, file_bytes), "در حال فشرده‌سازی")
+            output = await run_with_progress(query, asyncio.to_thread(process_compress, file_bytes), "در حال فشرده‌سازی")
             await context.bot.send_document(chat_id=user_id, document=output)
             await query.message.delete()
 
         elif action == 'add_numbers':
-            output = await run_with_fake_progress(query, asyncio.to_thread(process_add_numbers, file_bytes), "در حال شماره‌گذاری")
+            output = await run_with_progress(query, asyncio.to_thread(process_add_numbers, file_bytes), "در حال شماره‌گذاری")
             await context.bot.send_document(chat_id=user_id, document=output)
             await query.message.delete()
 
@@ -200,7 +264,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(0.2)
             await query.message.delete()
 
-        # ---- عملیات‌های سریع ----
         elif action == 'merge':
             if len(context.user_data['files']) < 2:
                 await query.edit_message_text("⚠️ برای ادغام باید حداقل دو فایل فرستاده باشی.")
@@ -342,7 +405,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.delete()
 
         elif state == 'waiting_watermark':
-            output = await run_with_fake_progress(msg, asyncio.to_thread(process_watermark, file_bytes, text), "در حال اعمال واترمارک")
+            output = await run_with_progress(msg, asyncio.to_thread(process_watermark, file_bytes, text), "در حال اعمال واترمارک")
             await context.bot.send_document(chat_id=user_id, document=output)
             await msg.delete()
 
@@ -359,7 +422,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.delete()
 
         elif state == 'waiting_cover':
-            output = await run_with_fake_progress(msg, asyncio.to_thread(process_add_cover, file_bytes, text), "در حال ساخت کاور")
+            output = await run_with_progress(msg, asyncio.to_thread(process_add_cover, file_bytes, text), "در حال ساخت کاور")
             await context.bot.send_document(chat_id=user_id, document=output)
             await msg.delete()
 
@@ -378,7 +441,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         photo_file = await update.message.photo[-1].get_file()
         img_bytes = await photo_file.download_as_bytearray()
-        output = await run_with_fake_progress(msg, asyncio.to_thread(process_add_logo, file_bytes, img_bytes), "در حال افزودن لوگو")
+        output = await run_with_progress(msg, asyncio.to_thread(process_add_logo, file_bytes, img_bytes), "در حال افزودن لوگو")
         await context.bot.send_document(chat_id=user_id, document=output)
         await msg.delete()
     except Exception as e:

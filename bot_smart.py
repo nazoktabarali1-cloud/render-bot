@@ -26,6 +26,7 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 MAX_FILE_SIZE_MB = 10
 MAX_PAGES_HEAVY = 25   # محدودیت برای عملیات سنگین (grayscale, watermark, split)
 
+
 # ==================== توابع پردازش (Sync) ====================
 
 def p_extract_text(file_bytes):
@@ -36,6 +37,7 @@ def p_extract_text(file_bytes):
     out = io.BytesIO(text.encode('utf-8'))
     out.name = "extracted.txt"
     return out
+
 
 def p_extract_tables(file_bytes):
     tables_text = ""
@@ -51,6 +53,7 @@ def p_extract_tables(file_bytes):
     out.name = "tables.txt"
     return out, None
 
+
 def p_extract_links(file_bytes):
     pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
     links = set()
@@ -64,6 +67,7 @@ def p_extract_links(file_bytes):
     out = io.BytesIO("\n".join(sorted(links)).encode('utf-8'))
     out.name = "links.txt"
     return out, None
+
 
 def p_extract_images(file_bytes):
     pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -85,6 +89,7 @@ def p_extract_images(file_bytes):
     zip_buffer.name = "images.zip"
     return zip_buffer, None
 
+
 def p_to_markdown(file_bytes):
     reader = PdfReader(io.BytesIO(file_bytes))
     md_text = ""
@@ -93,6 +98,7 @@ def p_to_markdown(file_bytes):
     out = io.BytesIO(md_text.encode('utf-8'))
     out.name = "text.md"
     return out
+
 
 def p_translate(file_bytes):
     reader = PdfReader(io.BytesIO(file_bytes))
@@ -116,6 +122,7 @@ def p_translate(file_bytes):
     out.name = "translated.txt"
     return out, None
 
+
 def p_to_word(file_bytes):
     doc = Document()
     for page in PdfReader(io.BytesIO(file_bytes)).pages:
@@ -126,6 +133,7 @@ def p_to_word(file_bytes):
     out.seek(0)
     out.name = "converted.docx"
     return out
+
 
 def p_split_single(file_bytes):
     reader = PdfReader(io.BytesIO(file_bytes))
@@ -143,6 +151,7 @@ def p_split_single(file_bytes):
     zip_buffer.name = "single_pages.zip"
     return zip_buffer, None
 
+
 def p_keep_first_page(file_bytes):
     reader = PdfReader(io.BytesIO(file_bytes))
     writer = PdfWriter()
@@ -153,6 +162,7 @@ def p_keep_first_page(file_bytes):
     out.seek(0)
     out.name = "first_page.pdf"
     return out
+
 
 def p_merge(files_list):
     writer = PdfWriter()
@@ -169,6 +179,7 @@ def p_merge(files_list):
     out.name = "merged.pdf"
     return out
 
+
 def p_reverse(file_bytes):
     writer = PdfWriter()
     for page in reversed(PdfReader(io.BytesIO(file_bytes)).pages):
@@ -178,6 +189,7 @@ def p_reverse(file_bytes):
     out.seek(0)
     out.name = "reversed.pdf"
     return out
+
 
 def p_rotate(file_bytes, angle=90):
     writer = PdfWriter()
@@ -189,6 +201,7 @@ def p_rotate(file_bytes, angle=90):
     out.seek(0)
     out.name = "rotated.pdf"
     return out
+
 
 def p_insert_blank(file_bytes, page_num):
     reader = PdfReader(io.BytesIO(file_bytes))
@@ -206,6 +219,7 @@ def p_insert_blank(file_bytes, page_num):
     out.name = "blank_inserted.pdf"
     return out
 
+
 def p_move_page_to_end(file_bytes, page_num):
     reader = PdfReader(io.BytesIO(file_bytes))
     total = len(reader.pages)
@@ -222,6 +236,7 @@ def p_move_page_to_end(file_bytes, page_num):
     out.seek(0)
     out.name = "moved.pdf"
     return out
+
 
 def p_highlight(file_bytes, text):
     pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -241,6 +256,7 @@ def p_highlight(file_bytes, text):
     out.name = "highlighted.pdf"
     return out, None
 
+
 def p_find_replace(file_bytes, old_text, new_text):
     """جایگزینی متن و برگرداندن فایل متنی (چون جایگزینی واقعی در PDF پیچیده و غیرقابل‌اعتماد است)"""
     reader = PdfReader(io.BytesIO(file_bytes))
@@ -249,6 +265,7 @@ def p_find_replace(file_bytes, old_text, new_text):
     out = io.BytesIO(new_full_text.encode('utf-8'))
     out.name = "replaced.txt"
     return out
+
 
 def p_clear_metadata(file_bytes):
     reader = PdfReader(io.BytesIO(file_bytes))
@@ -261,6 +278,7 @@ def p_clear_metadata(file_bytes):
     out.seek(0)
     out.name = "no_metadata.pdf"
     return out
+
 
 def p_restrict_print(file_bytes):
     reader = PdfReader(io.BytesIO(file_bytes))
@@ -275,6 +293,7 @@ def p_restrict_print(file_bytes):
     out.name = "restricted.pdf"
     return out
 
+
 def p_compress(file_bytes):
     pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
     out = io.BytesIO()
@@ -283,6 +302,7 @@ def p_compress(file_bytes):
     out.seek(0)
     out.name = "compressed.pdf"
     return out
+
 
 def p_resize_a4(file_bytes):
     reader = PdfReader(io.BytesIO(file_bytes))
@@ -295,6 +315,7 @@ def p_resize_a4(file_bytes):
     out.seek(0)
     out.name = "a4.pdf"
     return out
+
 
 def p_grayscale(file_bytes):
     pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -313,6 +334,7 @@ def p_grayscale(file_bytes):
     out.name = "grayscale.pdf"
     return out, None
 
+
 def p_timestamp(file_bytes):
     pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -324,6 +346,7 @@ def p_timestamp(file_bytes):
     out.seek(0)
     out.name = "timestamped.pdf"
     return out
+
 
 def p_add_numbers(file_bytes):
     pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -339,6 +362,7 @@ def p_add_numbers(file_bytes):
     out.seek(0)
     out.name = "numbered.pdf"
     return out
+
 
 def p_watermark(file_bytes, text):
     pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -362,6 +386,7 @@ def p_watermark(file_bytes, text):
     out.name = "watermarked.pdf"
     return out, None
 
+
 def p_add_cover(file_bytes, text):
     orig = fitz.open(stream=file_bytes, filetype="pdf")
     new = fitz.open()
@@ -377,6 +402,7 @@ def p_add_cover(file_bytes, text):
     out.name = "with_cover.pdf"
     return out
 
+
 def p_add_logo(file_bytes, img_bytes):
     pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
     page = pdf_doc[0]
@@ -389,6 +415,7 @@ def p_add_logo(file_bytes, img_bytes):
     out.name = "with_logo.pdf"
     return out
 
+
 def p_encrypt(file_bytes, password):
     writer = PdfWriter()
     reader = PdfReader(io.BytesIO(file_bytes))
@@ -400,6 +427,7 @@ def p_encrypt(file_bytes, password):
     out.seek(0)
     out.name = "encrypted.pdf"
     return out
+
 
 def p_decrypt(file_bytes, password):
     reader = PdfReader(io.BytesIO(file_bytes))
@@ -415,6 +443,7 @@ def p_decrypt(file_bytes, password):
     out.seek(0)
     out.name = "decrypted.pdf"
     return out, None
+
 
 def p_delete_pages(file_bytes, page_numbers):
     reader = PdfReader(io.BytesIO(file_bytes))
@@ -435,6 +464,7 @@ def p_delete_pages(file_bytes, page_numbers):
     out.name = "deleted_pages.pdf"
     return out
 
+
 # ==================== توابع کمکی ربات ====================
 
 async def run_bg(query, func, *args, action_name="پردازش"):
@@ -451,8 +481,10 @@ async def run_bg(query, func, *args, action_name="پردازش"):
         await asyncio.sleep(0.4)
     return await task
 
+
 def get_cancel_btn():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data='cancel')]])
+
 
 def get_main_keyboard():
     return [
@@ -488,6 +520,7 @@ def get_main_keyboard():
          InlineKeyboardButton("♻️ پاک کردن فایل‌ها", callback_data='clear_files')]
     ]
 
+
 # ==================== هندلرها ====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -500,6 +533,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚠️ حداکثر صفحات برای عملیات سنگین: {MAX_PAGES_HEAVY}\n\n"
         "لطفاً فایل PDF خود را بفرستید:"
     )
+
 
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
@@ -531,6 +565,7 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = len(context.user_data['files'])
     msg = "فایل دریافت شد! یک عملیات انتخاب کنید:" if count == 1 else f"✅ فایل {count} دریافت شد.\nفایل بعدی بفرستید یا عملیات را انتخاب کنید:"
     await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(get_main_keyboard()))
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -675,6 +710,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.exception("Error in button_handler")
         await query.edit_message_text(f"❌ خطا: {str(e)[:200]}")
 
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get('state')
     if not state:
@@ -763,6 +799,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         context.user_data['state'] = None
 
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('state') != 'waiting_logo':
         return
@@ -788,6 +825,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         context.user_data['state'] = None
 
+
 def main():
     if not TOKEN:
         raise ValueError("BOT_TOKEN environment variable is not set")
@@ -805,7 +843,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, handle_text))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/{TOKEN}"
@@ -818,6 +856,7 @@ def main():
     else:
         # برای تست محلی
         application.run_polling()
+
 
 if __name__ == '__main__':
     main()

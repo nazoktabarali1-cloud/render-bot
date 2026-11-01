@@ -24,7 +24,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get("PORT", "8443"))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 MAX_FILE_SIZE_MB = 10
-MAX_PAGES_HEAVY = 25   # محدودیت برای عملیات سنگین (grayscale, watermark, split)
+MAX_PAGES_HEAVY = 300   # محدودیت برای عملیات سنگین (grayscale, watermark, split)
 
 
 # ==================== توابع پردازش (Sync) ====================

@@ -18,7 +18,6 @@ PORT = int(os.environ.get("PORT", "8443"))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 MAX_FILE_SIZE_MB = 10
 
-# ---------- توابع کمکی ----------
 async def send_pdf_file(chat_id, context, writer, filename):
     output = io.BytesIO()
     writer.write(output)
@@ -27,19 +26,17 @@ async def send_pdf_file(chat_id, context, writer, filename):
     await context.bot.send_document(chat_id=chat_id, document=output)
 
 async def update_progress(query, current, total, action_name="پردازش"):
-    """ساخت و آپدیت نمودار پیشرفت"""
     percentage = int((current / total) * 100) if total > 0 else 0
     filled = int(percentage / 10)
     bar = "█" * filled + "░" * (10 - filled)
     try:
         await query.edit_message_text(f"{action_name}...\n\n📊 پیشرفت: [{bar}] {percentage}%")
     except Exception:
-        pass # نادیده گرفتن خطای عدم تغییر پیام
+        pass
 
 def get_cancel_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو عملیات", callback_data='cancel')]])
 
-# ---------- دستورات اصلی ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['files'] = []
     context.user_data['state'] = None
@@ -78,26 +75,23 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "فایل دریافت شد! چه کاری می‌خواهی انجام دهم؟" if count == 1 else f"فایل {count} دریافت شد. فایل بعدی را بفرست یا یک عملیات انتخاب کن."
     await update.message.reply_text(msg, reply_markup=reply_markup)
 
-# ---------- مدیریت دکمه‌ها ----------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     
-    # بررسی دکمه لغو
     if query.data == 'cancel':
         context.user_data['state'] = None
-        await query.edit_message_text("✅ عملیات لغو شد. می‌توانید فایل جدیدی بفرستید یا /start بزنید.")
+        await query.edit_message_text("✅ عملیات لغو شد.")
         return
 
     if 'files' not in context.user_data or not context.user_data['files']:
-        await query.edit_message_text("❌ فایل شما منقضی شده است. لطفاً دوباره PDF را بفرستید.")
+        await query.edit_message_text("❌ فایل شما منقضی شده است.")
         return
 
     action = query.data
     file_bytes = context.user_data['files'][0]
 
-    # ---- عملیات با نمودار پیشرفت ----
     if action == 'extract_text':
         reader = PdfReader(io.BytesIO(file_bytes))
         total_pages = len(reader.pages)
@@ -106,7 +100,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"--- صفحه {i+1} ---\n{page.extract_text() or ''}\n\n"
             if (i + 1) % max(1, total_pages // 10) == 0 or (i+1) == total_pages:
                 await update_progress(query, i+1, total_pages, "در حال استخراج متن")
-                await asyncio.sleep(0.1) # جلوگیری از بلاک شدن
+                await asyncio.sleep(0.1)
         
         if not text.strip():
             await query.edit_message_text("❌ متنی پیدا نشد.", reply_markup=get_cancel_keyboard())
@@ -118,7 +112,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == 'to_image':
         pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
-        total_pages = min(5, len(pdf_doc)) # فرض کنیم ۵ صفحه اول
+        total_pages = min(5, len(pdf_doc))
         for i in range(total_pages):
             await update_progress(query, i+1, total_pages, "در حال تبدیل به عکس")
             pix = pdf_doc[i].get_pixmap(dpi=100)
@@ -154,10 +148,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state'] = 'waiting_cover'
 
     elif action == 'add_logo':
-        await query.edit_message_text("🏷️ لطفاً **عکس لوگوی خود** را به عنوان یک عکس بفرستید:", reply_markup=get_cancel_keyboard())
+        await query.edit_message_text("🏷️ لطفاً **عکس لوگوی خود** را بفرستید:", reply_markup=get_cancel_keyboard())
         context.user_data['state'] = 'waiting_logo'
 
-    # ---- عملیات‌های آنی (بدون پیشرفت) ----
     elif action == 'merge':
         if len(context.user_data['files']) < 2:
             await query.edit_message_text("⚠️ برای ادغام باید حداقل دو فایل فرستاده باشی.", reply_markup=get_cancel_keyboard())
@@ -225,7 +218,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_pdf_file(user_id, context, writer, "rotated.pdf")
         await query.message.delete()
 
-# ---------- دریافت ورودی‌های متنی (با پیشرفت) ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get('state')
     if not state: return
@@ -312,7 +304,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         context.user_data['state'] = None
 
-# ---------- دریافت عکس (لوگو) ----------
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('state') != 'waiting_logo': return
     
@@ -341,7 +332,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state'] = None
 
 def main():
-    application = ApplicationBuilder().token(TOKEN).build()
+    # این خط مهم‌ترین تغییر است! concurrent_updates(True) مشکل دکمه‌ها را حل می‌کند
+    application = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))

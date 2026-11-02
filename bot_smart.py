@@ -23,8 +23,9 @@ logging.basicConfig(
 TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get("PORT", "8443"))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
-MAX_FILE_SIZE_MB = 10
-MAX_PAGES_HEAVY = 300   # محدودیت برای عملیات سنگین (grayscale, watermark, split)
+MAX_FILE_SIZE_MB = 25          # افزایش یافته
+MAX_PAGES_HEAVY = 500          # افزایش یافته برای سرور قوی‌تر
+MAX_FILES = 15
 
 
 # ==================== توابع پردازش (Sync) ====================
@@ -546,7 +547,6 @@ def p_to_images(file_bytes):
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for i, page in enumerate(pdf_doc):
-            # رزولوشن مناسب برای کیفیت خوب
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
             img_bytes = pix.tobytes("jpeg")
             zf.writestr(f"page_{i+1:03d}.jpg", img_bytes)
@@ -554,6 +554,173 @@ def p_to_images(file_bytes):
     zip_buffer.seek(0)
     zip_buffer.name = "pages_as_images.zip"
     return zip_buffer, None
+
+
+def p_info(file_bytes):
+    """اطعات کامل فایل PDF"""
+    reader = PdfReader(io.BytesIO(file_bytes))
+    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    meta = reader.metadata or {}
+    info_lines = [
+        f"📄 تعداد صفحات: {len(reader.pages)}",
+        f"🔒 رمزدار: {'بله' if reader.is_encrypted else 'خیر'}",
+        f"📦 حجم تقریبی: {len(file_bytes) / 1024:.1f} KB",
+        f"📐 اندازه صفحه اول: {pdf_doc[0].rect.width:.0f} × {pdf_doc[0].rect.height:.0f} pt" if len(pdf_doc) else "",
+        "",
+        "--- متادیتا ---",
+        f"عنوان: {meta.get('/Title', '—')}",
+        f"نویسنده: {meta.get('/Author', '—')}",
+        f"موضوع: {meta.get('/Subject', '—')}",
+        f"سازنده: {meta.get('/Creator', '—')}",
+        f"تولیدکننده: {meta.get('/Producer', '—')}",
+        f"تاریخ ایجاد: {meta.get('/CreationDate', '—')}",
+        f"تاریخ تغییر: {meta.get('/ModDate', '—')}",
+    ]
+    pdf_doc.close()
+    out = io.BytesIO("\n".join(info_lines).encode('utf-8'))
+    out.name = "pdf_info.txt"
+    return out
+
+
+def p_remove_blank_pages(file_bytes):
+    """حذف صفحات تقریباً خالی"""
+    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    writer = PdfWriter()
+    kept = 0
+    for i, page in enumerate(pdf_doc):
+        text = page.get_text().strip()
+        # اگر متن خیلی کم باشد و تصویر هم نداشته باشد، خالی حساب می‌شود
+        images = page.get_images()
+        if len(text) < 15 and len(images) == 0:
+            continue
+        # صفحه را از طریق pypdf اضافه می‌کنیم
+        kept += 1
+    pdf_doc.close()
+
+    # دوباره با pypdf صفحات غیرخالی را نگه می‌داریم
+    reader = _open_reader(file_bytes)
+    writer = PdfWriter()
+    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    for i, page in enumerate(reader.pages):
+        fitz_page = pdf_doc[i]
+        text = fitz_page.get_text().strip()
+        images = fitz_page.get_images()
+        if len(text) >= 15 or len(images) > 0:
+            writer.add_page(page)
+    pdf_doc.close()
+
+    if len(writer.pages) == 0:
+        return None, "همه صفحات خالی تشخیص داده شدند."
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+    out.name = "no_blank_pages.pdf"
+    return out, None
+
+
+def p_extract_pages_list(file_bytes, page_numbers):
+    """استخراج لیست صفحات (مثلاً 1,3,5-8,10)"""
+    reader = _open_reader(file_bytes)
+    total = len(reader.pages)
+    pages_to_keep = sorted(set(p for p in page_numbers if 1 <= p <= total))
+    if not pages_to_keep:
+        raise ValueError(f"هیچ صفحه معتبری وارد نشده. فایل {total} صفحه دارد.")
+    writer = PdfWriter()
+    for p in pages_to_keep:
+        writer.add_page(reader.pages[p - 1])
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+    out.name = "selected_pages.pdf"
+    return out
+
+
+def p_add_header_footer(file_bytes, header_text="", footer_text=""):
+    """افزودن هدر و فوتر به همه صفحات"""
+    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    for i, page in enumerate(pdf_doc):
+        if header_text:
+            page.insert_text((40, 25), header_text, fontsize=10, color=(0.3, 0.3, 0.3))
+        if footer_text:
+            # پشتیبانی از {page} و {total}
+            ft = footer_text.replace("{page}", str(i + 1)).replace("{total}", str(len(pdf_doc)))
+            page.insert_text((40, page.rect.height - 20), ft, fontsize=10, color=(0.3, 0.3, 0.3))
+    out = io.BytesIO()
+    pdf_doc.save(out)
+    pdf_doc.close()
+    out.seek(0)
+    out.name = "header_footer.pdf"
+    return out
+
+
+def p_images_to_pdf(image_bytes_list):
+    """تبدیل چند تصویر به یک PDF"""
+    if not image_bytes_list:
+        return None, "هیچ تصویری ارسال نشده."
+    new_pdf = fitz.open()
+    for img_bytes in image_bytes_list:
+        try:
+            img_doc = fitz.open(stream=img_bytes, filetype="jpeg")
+            if img_doc.page_count == 0:
+                img_doc = fitz.open(stream=img_bytes, filetype="png")
+            rect = img_doc[0].rect
+            page = new_pdf.new_page(width=rect.width, height=rect.height)
+            page.insert_image(page.rect, stream=img_bytes)
+            img_doc.close()
+        except Exception:
+            # اگر فرمت تشخیص داده نشد، با pixmap امتحان می‌کنیم
+            try:
+                pix = fitz.Pixmap(img_bytes)
+                page = new_pdf.new_page(width=pix.width, height=pix.height)
+                page.insert_image(page.rect, pixmap=pix)
+            except Exception:
+                continue
+    if new_pdf.page_count == 0:
+        new_pdf.close()
+        return None, "نتوانستم هیچ تصویری را به PDF تبدیل کنم."
+    out = io.BytesIO()
+    new_pdf.save(out)
+    new_pdf.close()
+    out.seek(0)
+    out.name = "images_to_pdf.pdf"
+    return out, None
+
+
+def p_rotate_specific(file_bytes, page_num, angle=90):
+    """چرخش یک صفحه خاص"""
+    reader = _open_reader(file_bytes)
+    total = len(reader.pages)
+    if page_num < 1 or page_num > total:
+        raise ValueError(f"شماره صفحه باید بین ۱ تا {total} باشد.")
+    writer = PdfWriter()
+    for i, page in enumerate(reader.pages):
+        if i + 1 == page_num:
+            page.rotate(angle)
+        writer.add_page(page)
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+    out.name = f"rotated_page_{page_num}.pdf"
+    return out
+
+
+def p_duplicate_page(file_bytes, page_num, times=1):
+    """تکرار یک صفحه چند بار پشت سر هم"""
+    reader = _open_reader(file_bytes)
+    total = len(reader.pages)
+    if page_num < 1 or page_num > total:
+        raise ValueError(f"شماره صفحه باید بین ۱ تا {total} باشد.")
+    writer = PdfWriter()
+    for i, page in enumerate(reader.pages):
+        writer.add_page(page)
+        if i + 1 == page_num:
+            for _ in range(times):
+                writer.add_page(page)
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+    out.name = "duplicated.pdf"
+    return out
 
 
 # ==================== توابع کمکی ربات ====================
@@ -579,38 +746,45 @@ def get_cancel_btn():
 
 def get_main_keyboard():
     return [
-        [InlineKeyboardButton("📝 استخراج متن", callback_data='extract_text'),
-         InlineKeyboardButton("📊 استخراج جدول", callback_data='extract_tables')],
-        [InlineKeyboardButton("🔗 استخراج لینک", callback_data='extract_links'),
-         InlineKeyboardButton("🖼️ استخراج عکس‌ها", callback_data='extract_images')],
-        [InlineKeyboardButton("🌐 ترجمه به انگلیسی", callback_data='translate'),
-         InlineKeyboardButton("📄 تبدیل به Word", callback_data='to_word')],
-        [InlineKeyboardButton("📑 Markdown", callback_data='to_markdown'),
-         InlineKeyboardButton("🔇 فشرده‌سازی", callback_data='compress')],
-        [InlineKeyboardButton("🔗 ادغام فایل‌ها", callback_data='merge'),
-         InlineKeyboardButton("✂️ تفکیک به تک‌صفحه", callback_data='split_single')],
-        [InlineKeyboardButton("📄 فقط صفحه اول", callback_data='keep_first'),
-         InlineKeyboardButton("🔢 شماره‌گذاری", callback_data='add_numbers')],
+        [InlineKeyboardButton("ℹ️ اطلاعات فایل", callback_data='info'),
+         InlineKeyboardButton("📝 استخراج متن", callback_data='extract_text')],
+        [InlineKeyboardButton("📊 استخراج جدول", callback_data='extract_tables'),
+         InlineKeyboardButton("🔗 استخراج لینک", callback_data='extract_links')],
+        [InlineKeyboardButton("🖼️ استخراج عکس‌ها", callback_data='extract_images'),
+         InlineKeyboardButton("🌐 ترجمه", callback_data='translate')],
+        [InlineKeyboardButton("📄 به Word", callback_data='to_word'),
+         InlineKeyboardButton("📑 Markdown", callback_data='to_markdown')],
+        [InlineKeyboardButton("🔇 فشرده‌سازی", callback_data='compress'),
+         InlineKeyboardButton("🔗 ادغام فایل‌ها", callback_data='merge')],
+        [InlineKeyboardButton("✂️ تفکیک تک‌صفحه", callback_data='split_single'),
+         InlineKeyboardButton("📄 فقط صفحه اول", callback_data='keep_first')],
+        [InlineKeyboardButton("📑 استخراج محدوده", callback_data='extract_range'),
+         InlineKeyboardButton("📋 استخراج صفحات", callback_data='extract_pages')],
         [InlineKeyboardButton("🗑️ حذف صفحات", callback_data='delete_pages'),
-         InlineKeyboardButton("➕ درج صفحه خالی", callback_data='insert_blank')],
-        [InlineKeyboardButton("📌 جابجایی صفحه", callback_data='move_page'),
-         InlineKeyboardButton("🔄 معکوس کردن", callback_data='reverse')],
-        [InlineKeyboardButton("🔄 چرخش ۹۰ درجه", callback_data='rotate'),
-         InlineKeyboardButton("🔍 جایگزینی متن", callback_data='find_replace')],
+         InlineKeyboardButton("🧹 حذف صفحات خالی", callback_data='remove_blank')],
+        [InlineKeyboardButton("➕ صفحه خالی", callback_data='insert_blank'),
+         InlineKeyboardButton("📌 جابجایی صفحه", callback_data='move_page')],
+        [InlineKeyboardButton("🔄 معکوس", callback_data='reverse'),
+         InlineKeyboardButton("🔄 چرخش همه", callback_data='rotate')],
+        [InlineKeyboardButton("🔃 چرخش یک صفحه", callback_data='rotate_one'),
+         InlineKeyboardButton("📑 تکرار صفحه", callback_data='duplicate')],
+        [InlineKeyboardButton("🔢 شماره‌گذاری", callback_data='add_numbers'),
+         InlineKeyboardButton("📰 هدر و فوتر", callback_data='header_footer')],
         [InlineKeyboardButton("🖍️ هایلایت", callback_data='highlight'),
          InlineKeyboardButton("💧 واترمارک", callback_data='watermark')],
-        [InlineKeyboardButton("📏 تغییر به A4", callback_data='resize_a4'),
-         InlineKeyboardButton("⚫ سیاه و سفید", callback_data='grayscale')],
-        [InlineKeyboardButton("⏱️ درج تاریخ", callback_data='timestamp'),
-         InlineKeyboardButton("🧹 پاکسازی متادیتا", callback_data='clear_metadata')],
+        [InlineKeyboardButton("🔍 جایگزینی متن", callback_data='find_replace'),
+         InlineKeyboardButton("⏱️ درج تاریخ", callback_data='timestamp')],
+        [InlineKeyboardButton("📏 به A4", callback_data='resize_a4'),
+         InlineKeyboardButton("⚫ سیاه‌وسفید", callback_data='grayscale')],
+        [InlineKeyboardButton("🖼️ PDF→عکس", callback_data='to_images'),
+         InlineKeyboardButton("🖼️ عکس→PDF", callback_data='images_to_pdf')],
         [InlineKeyboardButton("🔒 رمزگذاری", callback_data='encrypt'),
          InlineKeyboardButton("🔓 باز کردن قفل", callback_data='decrypt')],
-        [InlineKeyboardButton("🚫 جلوگیری از پرینت", callback_data='restrict_print'),
-         InlineKeyboardButton("🖼️ افزودن کاور", callback_data='add_cover')],
-        [InlineKeyboardButton("🏷️ افزودن لوگو", callback_data='add_logo'),
-         InlineKeyboardButton("📑 استخراج محدوده", callback_data='extract_range')],
-        [InlineKeyboardButton("🖼️ PDF به عکس (ZIP)", callback_data='to_images'),
-         InlineKeyboardButton("♻️ پاک کردن فایل‌ها", callback_data='clear_files')]
+        [InlineKeyboardButton("🚫 ضدپرینت", callback_data='restrict_print'),
+         InlineKeyboardButton("🧹 پاک متادیتا", callback_data='clear_metadata')],
+        [InlineKeyboardButton("🖼️ کاور", callback_data='add_cover'),
+         InlineKeyboardButton("🏷️ لوگو", callback_data='add_logo')],
+        [InlineKeyboardButton("♻️ پاک کردن فایل‌ها", callback_data='clear_files')]
     ]
 
 
@@ -619,12 +793,14 @@ def get_main_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data['files'] = []
+    context.user_data['images'] = []
     context.user_data['state'] = None
     await update.message.reply_text(
         "سلام! به دستیار جامع PDF خوش آمدید. 📄\n\n"
         f"⚠️ حداکثر حجم هر فایل: {MAX_FILE_SIZE_MB} مگابایت\n"
-        f"⚠️ حداکثر صفحات برای عملیات سنگین: {MAX_PAGES_HEAVY}\n\n"
-        "لطفاً فایل PDF خود را بفرستید:"
+        f"⚠️ حداکثر صفحات عملیات سنگین: {MAX_PAGES_HEAVY}\n"
+        f"⚠️ حداکثر تعداد فایل: {MAX_FILES}\n\n"
+        "فایل PDF بفرستید یا برای تبدیل عکس به PDF، عکس‌ها را بفرستید."
     )
 
 
@@ -642,8 +818,8 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['files'] = []
 
     # جلوگیری از انباشته شدن بیش از حد فایل
-    if len(context.user_data['files']) >= 8:
-        await update.message.reply_text("⚠️ حداکثر ۸ فایل می‌توانید نگه دارید. ابتدا از دکمه «پاک کردن فایل‌ها» استفاده کنید.")
+    if len(context.user_data['files']) >= MAX_FILES:
+        await update.message.reply_text(f"⚠️ حداکثر {MAX_FILES} فایل می‌توانید نگه دارید. ابتدا از دکمه «پاک کردن فایل‌ها» استفاده کنید.")
         return
 
     try:
@@ -738,6 +914,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 out, err = result
             else:
                 out = result
+        elif action == 'info':
+            out = await run_bg(query, p_info, file_bytes, action_name="دریافت اطلاعات")
+        elif action == 'remove_blank':
+            result = await run_bg(query, p_remove_blank_pages, file_bytes, action_name="حذف صفحات خالی")
+            if isinstance(result, tuple):
+                out, err = result
+            else:
+                out = result
 
         # عملیات‌های نیازمند ورودی
         elif action == 'extract_range':
@@ -746,6 +930,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=get_cancel_btn()
             )
             context.user_data['state'] = 'waiting_extract_range'
+            return
+        elif action == 'extract_pages':
+            await query.edit_message_text(
+                "📋 شماره صفحات را وارد کنید (مثال: 1,3,5-8,10):",
+                reply_markup=get_cancel_btn()
+            )
+            context.user_data['state'] = 'waiting_extract_pages'
+            return
+        elif action == 'header_footer':
+            await query.edit_message_text(
+                "📰 هدر و فوتر را به این شکل بفرستید:\nهدر | فوتر\n\n"
+                "می‌توانید از {page} و {total} در فوتر استفاده کنید.\n"
+                "مثال: گزارش ماهانه | صفحه {page} از {total}",
+                reply_markup=get_cancel_btn()
+            )
+            context.user_data['state'] = 'waiting_header_footer'
+            return
+        elif action == 'rotate_one':
+            await query.edit_message_text(
+                "🔃 شماره صفحه و زاویه را بفرستید:\nمثال: 3 90\n(صفحه ۳ را ۹۰ درجه بچرخان)",
+                reply_markup=get_cancel_btn()
+            )
+            context.user_data['state'] = 'waiting_rotate_one'
+            return
+        elif action == 'duplicate':
+            await query.edit_message_text(
+                "📑 شماره صفحه و تعداد تکرار را بفرستید:\nمثال: 2 3\n(صفحه ۲ را ۳ بار تکرار کن)",
+                reply_markup=get_cancel_btn()
+            )
+            context.user_data['state'] = 'waiting_duplicate'
+            return
+        elif action == 'images_to_pdf':
+            context.user_data['images'] = []
+            context.user_data['state'] = 'waiting_images_to_pdf'
+            await query.edit_message_text(
+                "🖼️ عکس‌ها را یکی‌یکی بفرستید.\nوقتی تمام شد بنویسید: تمام",
+                reply_markup=get_cancel_btn()
+            )
             return
         elif action == 'encrypt':
             await query.edit_message_text("🔑 رمز عبور دلخواه را بفرستید:", reply_markup=get_cancel_btn())
@@ -906,6 +1128,64 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 err = "فرمت اشتباه است. مثال صحیح: 5-12 یا فقط 7"
 
+        elif state == 'waiting_extract_pages':
+            try:
+                pages = []
+                for part in text.replace(" ", "").split(","):
+                    if "-" in part:
+                        a, b = part.split("-")
+                        pages.extend(range(int(a), int(b) + 1))
+                    else:
+                        pages.append(int(part))
+                out = await asyncio.to_thread(p_extract_pages_list, file_bytes, pages)
+            except ValueError as ve:
+                err = str(ve)
+            except Exception:
+                err = "فرمت اشتباه است. مثال: 1,3,5-8,10"
+
+        elif state == 'waiting_header_footer':
+            if "|" not in text:
+                err = "فرمت اشتباه است. باید به شکل: هدر | فوتر باشد."
+            else:
+                parts = text.split("|", 1)
+                header = parts[0].strip()
+                footer = parts[1].strip()
+                out = await asyncio.to_thread(p_add_header_footer, file_bytes, header, footer)
+
+        elif state == 'waiting_rotate_one':
+            try:
+                parts = text.split()
+                page_num = int(parts[0])
+                angle = int(parts[1]) if len(parts) > 1 else 90
+                out = await asyncio.to_thread(p_rotate_specific, file_bytes, page_num, angle)
+            except Exception:
+                err = "فرمت اشتباه است. مثال: 3 90"
+
+        elif state == 'waiting_duplicate':
+            try:
+                parts = text.split()
+                page_num = int(parts[0])
+                times = int(parts[1]) if len(parts) > 1 else 1
+                out = await asyncio.to_thread(p_duplicate_page, file_bytes, page_num, times)
+            except Exception:
+                err = "فرمت اشتباه است. مثال: 2 3"
+
+        elif state == 'waiting_images_to_pdf':
+            if text.strip() in ("تمام", "تمام شد", "done", "Done"):
+                images = context.user_data.get('images', [])
+                if not images:
+                    err = "هیچ عکسی ارسال نشده."
+                else:
+                    result = await asyncio.to_thread(p_images_to_pdf, images)
+                    if isinstance(result, tuple):
+                        out, err = result
+                    else:
+                        out = result
+                context.user_data['images'] = []
+            else:
+                await msg.edit_text("عکس بفرستید یا وقتی تمام شد بنویسید: تمام")
+                return  # state را پاک نکن (finally را رد می‌کنیم با return از تابع)
+
         if err:
             await msg.edit_text(f"❌ {err}")
         elif out:
@@ -918,11 +1198,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.exception("Error in handle_text")
         await msg.edit_text(f"❌ خطا: {str(e)[:200]}")
     finally:
-        context.user_data['state'] = None
+        # فقط اگر هنوز در حالت جمع‌آوری عکس نیستیم state را پاک کن
+        if context.user_data.get('state') != 'waiting_images_to_pdf':
+            context.user_data['state'] = None
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('state') != 'waiting_logo':
+    state = context.user_data.get('state')
+
+    # حالت تبدیل عکس به PDF
+    if state == 'waiting_images_to_pdf':
+        try:
+            photo_file = await update.message.photo[-1].get_file()
+            img_bytes = await photo_file.download_as_bytearray()
+            if 'images' not in context.user_data:
+                context.user_data['images'] = []
+            context.user_data['images'].append(bytes(img_bytes))
+            count = len(context.user_data['images'])
+            await update.message.reply_text(f"✅ عکس {count} دریافت شد.\nعکس بعدی را بفرستید یا بنویسید: تمام")
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطا در دریافت عکس: {str(e)[:100]}")
+        return
+
+    # حالت افزودن لوگو
+    if state != 'waiting_logo':
         return
 
     if 'files' not in context.user_data or not context.user_data['files']:

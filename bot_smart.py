@@ -23,25 +23,49 @@ logging.basicConfig(
 TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get("PORT", "8443"))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
-MAX_FILE_SIZE_MB = 25          # افزایش یافته
-MAX_PAGES_HEAVY = 500          # افزایش یافته برای سرور قوی‌تر
+MAX_FILE_SIZE_MB = 50          # سقف حجم هر فایل (مگابایت)
+MAX_PAGES_HEAVY = 500          # سقف صفحات برای عملیات سنگین
 MAX_FILES = 15
 
 
 # ==================== توابع پردازش (Sync) ====================
 
 def _open_reader(file_bytes):
-    """باز کردن PDF با پیام خطای واضح اگر رمزدار باشد"""
+    """باز کردن PDF با pypdf — پیام واضح برای فایل رمزدار"""
     reader = PdfReader(io.BytesIO(file_bytes))
     if reader.is_encrypted:
-        # سعی می‌کنیم بدون رمز باز کنیم (بعضی فایل‌ها فقط owner password دارند)
         try:
             result = reader.decrypt("")
             if result == 0:
                 raise ValueError("این فایل رمزدار است. ابتدا با دکمه «باز کردن قفل» رمز را وارد کنید.")
+        except ValueError:
+            raise
         except Exception:
             raise ValueError("این فایل رمزدار است. ابتدا با دکمه «باز کردن قفل» رمز را وارد کنید.")
     return reader
+
+
+def _open_fitz(file_bytes):
+    """باز کردن PDF با PyMuPDF — تلاش برای فایل‌های با owner-password خالی"""
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+    except Exception as e:
+        raise ValueError(f"باز کردن PDF ناموفق بود: {e}")
+    if doc.is_encrypted:
+        try:
+            auth = doc.authenticate("")
+            if not auth:
+                doc.close()
+                raise ValueError("این فایل رمزدار است. ابتدا با دکمه «باز کردن قفل» رمز را وارد کنید.")
+        except ValueError:
+            raise
+        except Exception:
+            try:
+                doc.close()
+            except Exception:
+                pass
+            raise ValueError("این فایل رمزدار است. ابتدا با دکمه «باز کردن قفل» رمز را وارد کنید.")
+    return doc
 
 
 def p_extract_text(file_bytes):
@@ -70,7 +94,7 @@ def p_extract_tables(file_bytes):
 
 
 def p_extract_links(file_bytes):
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pdf_doc = _open_fitz(file_bytes)
     links = set()
     for page in pdf_doc:
         for link in page.get_links():
@@ -85,7 +109,7 @@ def p_extract_links(file_bytes):
 
 
 def p_extract_images(file_bytes):
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pdf_doc = _open_fitz(file_bytes)
     zip_buffer = io.BytesIO()
     count = 0
     with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -213,13 +237,23 @@ def p_keep_first_page(file_bytes):
 
 def p_merge(files_list):
     writer = PdfWriter()
+    added = 0
     for f_bytes in files_list:
         try:
             reader = PdfReader(io.BytesIO(f_bytes))
+            if reader.is_encrypted:
+                try:
+                    if reader.decrypt("") == 0:
+                        continue
+                except Exception:
+                    continue
             for page in reader.pages:
                 writer.add_page(page)
+                added += 1
         except Exception:
             continue
+    if added == 0:
+        raise ValueError("هیچ صفحه‌ای برای ادغام اضافه نشد. فایل‌ها ممکن است رمزدار یا خراب باشند.")
     out = io.BytesIO()
     writer.write(out)
     out.seek(0)
@@ -296,7 +330,7 @@ def p_move_page_to_end(file_bytes, page_num):
 
 
 def p_highlight(file_bytes, text):
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pdf_doc = _open_fitz(file_bytes)
     found = False
     for page in pdf_doc:
         rects = page.search_for(text)
@@ -352,7 +386,7 @@ def p_restrict_print(file_bytes):
 
 
 def p_compress(file_bytes):
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pdf_doc = _open_fitz(file_bytes)
     out = io.BytesIO()
     pdf_doc.save(out, garbage=4, deflate=True, clean=True)
     pdf_doc.close()
@@ -376,7 +410,7 @@ def p_resize_a4(file_bytes):
 
 
 def p_grayscale(file_bytes):
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pdf_doc = _open_fitz(file_bytes)
     if len(pdf_doc) > MAX_PAGES_HEAVY:
         pdf_doc.close()
         return None, f"حداکثر {MAX_PAGES_HEAVY} صفحه برای سیاه‌وسفید مجاز است."
@@ -394,7 +428,7 @@ def p_grayscale(file_bytes):
 
 
 def p_timestamp(file_bytes):
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pdf_doc = _open_fitz(file_bytes)
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     for page in pdf_doc:
         page.insert_text((10, 30), f"Generated: {now}", fontsize=10, color=(0.5, 0.5, 0.5))
@@ -407,7 +441,7 @@ def p_timestamp(file_bytes):
 
 
 def p_add_numbers(file_bytes):
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pdf_doc = _open_fitz(file_bytes)
     for i, page in enumerate(pdf_doc):
         page.insert_text(
             (page.rect.width / 2, page.rect.height - 20),
@@ -423,7 +457,7 @@ def p_add_numbers(file_bytes):
 
 
 def p_watermark(file_bytes, text):
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pdf_doc = _open_fitz(file_bytes)
     if len(pdf_doc) > MAX_PAGES_HEAVY:
         pdf_doc.close()
         return None, f"حداکثر {MAX_PAGES_HEAVY} صفحه برای واترمارک مجاز است."
@@ -445,7 +479,7 @@ def p_watermark(file_bytes, text):
 
 
 def p_add_cover(file_bytes, text):
-    orig = fitz.open(stream=file_bytes, filetype="pdf")
+    orig = _open_fitz(file_bytes)
     new = fitz.open()
     cover = new.new_page(width=595, height=842)
     # عنوان در مرکز
@@ -461,7 +495,7 @@ def p_add_cover(file_bytes, text):
 
 
 def p_add_logo(file_bytes, img_bytes):
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pdf_doc = _open_fitz(file_bytes)
     page = pdf_doc[0]
     rect = fitz.Rect(page.rect.width - 120, 20, page.rect.width - 20, 120)
     page.insert_image(rect, stream=img_bytes)
@@ -540,7 +574,7 @@ def p_extract_range(file_bytes, start_page, end_page):
 
 def p_to_images(file_bytes):
     """تبدیل هر صفحه PDF به تصویر JPEG و قرار دادن در ZIP"""
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pdf_doc = _open_fitz(file_bytes)
     if len(pdf_doc) > MAX_PAGES_HEAVY:
         pdf_doc.close()
         return None, f"حداکثر {MAX_PAGES_HEAVY} صفحه برای تبدیل به تصویر مجاز است."
@@ -559,7 +593,7 @@ def p_to_images(file_bytes):
 def p_info(file_bytes):
     """اطعات کامل فایل PDF"""
     reader = PdfReader(io.BytesIO(file_bytes))
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pdf_doc = _open_fitz(file_bytes)
     meta = reader.metadata or {}
     info_lines = [
         f"📄 تعداد صفحات: {len(reader.pages)}",
@@ -583,32 +617,17 @@ def p_info(file_bytes):
 
 
 def p_remove_blank_pages(file_bytes):
-    """حذف صفحات تقریباً خالی"""
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
-    writer = PdfWriter()
-    kept = 0
-    for i, page in enumerate(pdf_doc):
-        text = page.get_text().strip()
-        # اگر متن خیلی کم باشد و تصویر هم نداشته باشد، خالی حساب می‌شود
-        images = page.get_images()
-        if len(text) < 15 and len(images) == 0:
-            continue
-        # صفحه را از طریق pypdf اضافه می‌کنیم
-        kept += 1
-    pdf_doc.close()
-
-    # دوباره با pypdf صفحات غیرخالی را نگه می‌داریم
+    """حذف صفحات تقریباً خالی (متن خیلی کم و بدون تصویر)"""
     reader = _open_reader(file_bytes)
+    pdf_doc = _open_fitz(file_bytes)
     writer = PdfWriter()
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
     for i, page in enumerate(reader.pages):
         fitz_page = pdf_doc[i]
-        text = fitz_page.get_text().strip()
+        txt = (fitz_page.get_text() or "").strip()
         images = fitz_page.get_images()
-        if len(text) >= 15 or len(images) > 0:
+        if len(txt) >= 15 or len(images) > 0:
             writer.add_page(page)
     pdf_doc.close()
-
     if len(writer.pages) == 0:
         return None, "همه صفحات خالی تشخیص داده شدند."
     out = io.BytesIO()
@@ -637,7 +656,7 @@ def p_extract_pages_list(file_bytes, page_numbers):
 
 def p_add_header_footer(file_bytes, header_text="", footer_text=""):
     """افزودن هدر و فوتر به همه صفحات"""
-    pdf_doc = fitz.open(stream=file_bytes, filetype="pdf")
+    pdf_doc = _open_fitz(file_bytes)
     for i, page in enumerate(pdf_doc):
         if header_text:
             page.insert_text((40, 25), header_text, fontsize=10, color=(0.3, 0.3, 0.3))
@@ -725,6 +744,99 @@ def p_duplicate_page(file_bytes, page_num, times=1):
 
 # ==================== توابع کمکی ربات ====================
 
+
+def p_text_stats(file_bytes):
+    """آمار متن: کلمات، کاراکتر، صفحات دارای متن"""
+    reader = _open_reader(file_bytes)
+    total_chars = 0
+    total_words = 0
+    pages_with_text = 0
+    per_page = []
+    for i, page in enumerate(reader.pages):
+        t = page.extract_text() or ""
+        words = len(t.split())
+        chars = len(t)
+        total_chars += chars
+        total_words += words
+        if t.strip():
+            pages_with_text += 1
+        per_page.append(f"صفحه {i+1}: {words} کلمه / {chars} کاراکتر")
+    lines = [
+        "📊 آمار متن PDF",
+        f"صفحات: {len(reader.pages)}",
+        f"صفحات دارای متن: {pages_with_text}",
+        f"کل کلمات: {total_words}",
+        f"کل کاراکتر: {total_chars}",
+        "",
+        "--- به تفکیک صفحه ---",
+        *per_page[:50],
+    ]
+    if len(per_page) > 50:
+        lines.append(f"... و {len(per_page)-50} صفحه دیگر")
+    out = io.BytesIO("\n".join(lines).encode("utf-8"))
+    out.name = "text_stats.txt"
+    return out
+
+
+def p_split_every_n(file_bytes, n):
+    """تقسیم PDF به فایل‌های n صفحه‌ای داخل ZIP"""
+    reader = _open_reader(file_bytes)
+    total = len(reader.pages)
+    if n < 1:
+        raise ValueError("تعداد صفحات هر بخش باید حداقل ۱ باشد.")
+    if total > MAX_PAGES_HEAVY:
+        return None, f"حداکثر {MAX_PAGES_HEAVY} صفحه مجاز است."
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        part = 1
+        for start in range(0, total, n):
+            writer = PdfWriter()
+            for i in range(start, min(start + n, total)):
+                writer.add_page(reader.pages[i])
+            buf = io.BytesIO()
+            writer.write(buf)
+            zf.writestr(f"part_{part:03d}_p{start+1}-{min(start+n, total)}.pdf", buf.getvalue())
+            part += 1
+    zip_buffer.seek(0)
+    zip_buffer.name = f"split_every_{n}.zip"
+    return zip_buffer, None
+
+
+def p_stamp_text(file_bytes, text, position="bottom"):
+    """مهر متن در پایین یا بالای همه صفحات"""
+    pdf_doc = _open_fitz(file_bytes)
+    for page in pdf_doc:
+        if position == "top":
+            y = 30
+        else:
+            y = page.rect.height - 25
+        page.insert_text((40, y), text, fontsize=11, color=(0.2, 0.2, 0.6))
+    out = io.BytesIO()
+    pdf_doc.save(out)
+    pdf_doc.close()
+    out.seek(0)
+    out.name = "stamped.pdf"
+    return out
+
+
+def p_interleave(file_a, file_b):
+    """ادغام یک‌درمیان صفحات دو PDF (A1,B1,A2,B2,...)"""
+    ra = _open_reader(file_a)
+    rb = _open_reader(file_b)
+    writer = PdfWriter()
+    n = max(len(ra.pages), len(rb.pages))
+    for i in range(n):
+        if i < len(ra.pages):
+            writer.add_page(ra.pages[i])
+        if i < len(rb.pages):
+            writer.add_page(rb.pages[i])
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+    out.name = "interleaved.pdf"
+    return out
+
+
 async def run_bg(query, func, *args, action_name="پردازش"):
     """اجرای تابع سنگین در thread جدا + نمایش progress ساده"""
     task = asyncio.create_task(asyncio.to_thread(func, *args))
@@ -784,6 +896,10 @@ def get_main_keyboard():
          InlineKeyboardButton("🧹 پاک متادیتا", callback_data='clear_metadata')],
         [InlineKeyboardButton("🖼️ کاور", callback_data='add_cover'),
          InlineKeyboardButton("🏷️ لوگو", callback_data='add_logo')],
+        [InlineKeyboardButton("📊 آمار متن", callback_data='text_stats'),
+         InlineKeyboardButton("📦 تقسیم هر N صفحه", callback_data='split_every')],
+        [InlineKeyboardButton("🔖 مهر متن", callback_data='stamp'),
+         InlineKeyboardButton("🔀 ادغام یک‌درمیان", callback_data='interleave')],
         [InlineKeyboardButton("♻️ پاک کردن فایل‌ها", callback_data='clear_files')]
     ]
 
@@ -800,7 +916,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚠️ حداکثر حجم هر فایل: {MAX_FILE_SIZE_MB} مگابایت\n"
         f"⚠️ حداکثر صفحات عملیات سنگین: {MAX_PAGES_HEAVY}\n"
         f"⚠️ حداکثر تعداد فایل: {MAX_FILES}\n\n"
-        "فایل PDF بفرستید یا برای تبدیل عکس به PDF، عکس‌ها را بفرستید."
+        "فایل PDF بفرستید.\n"
+        "عکس→PDF: دستور /img2pdf یا دکمه مربوطه بعد از ارسال PDF."
     )
 
 
@@ -852,11 +969,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✅ همه فایل‌ها پاک شدند.\nلطفاً فایل جدید بفرستید.")
         return
 
+    action = query.data
+
+    # عکس→PDF نیازی به فایل PDF از قبل ندارد
+    if action == 'images_to_pdf':
+        context.user_data['images'] = []
+        context.user_data['state'] = 'waiting_images_to_pdf'
+        await query.edit_message_text(
+            "🖼️ عکس‌ها را یکی‌یکی بفرستید.\nوقتی تمام شد بنویسید: تمام",
+            reply_markup=get_cancel_btn()
+        )
+        return
+
     if 'files' not in context.user_data or not context.user_data['files']:
         await query.edit_message_text("❌ فایلی موجود نیست. لطفاً ابتدا فایل PDF بفرستید.")
         return
 
-    action = query.data
     file_bytes = context.user_data['files'][0]
     out = None
     err = None
@@ -922,6 +1050,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 out, err = result
             else:
                 out = result
+        elif action == 'text_stats':
+            out = await run_bg(query, p_text_stats, file_bytes, action_name="آمار متن")
+        elif action == 'interleave':
+            files = context.user_data.get('files') or []
+            if len(files) < 2:
+                await query.edit_message_text("⚠️ برای ادغام یک‌درمیان حداقل دو فایل PDF بفرستید.")
+                return
+            out = await run_bg(query, p_interleave, files[0], files[1], action_name="ادغام یک‌درمیان")
 
         # عملیات‌های نیازمند ورودی
         elif action == 'extract_range':
@@ -961,13 +1097,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             context.user_data['state'] = 'waiting_duplicate'
             return
-        elif action == 'images_to_pdf':
-            context.user_data['images'] = []
-            context.user_data['state'] = 'waiting_images_to_pdf'
+        elif action == 'split_every':
             await query.edit_message_text(
-                "🖼️ عکس‌ها را یکی‌یکی بفرستید.\nوقتی تمام شد بنویسید: تمام",
+                "📦 هر چند صفحه یک فایل شود؟\nمثال: 5",
                 reply_markup=get_cancel_btn()
             )
+            context.user_data['state'] = 'waiting_split_every'
+            return
+        elif action == 'stamp':
+            await query.edit_message_text(
+                "🔖 متن مهر را بفرستید:\nمثال: محرمانه\nیا: top|پیش‌نویس",
+                reply_markup=get_cancel_btn()
+            )
+            context.user_data['state'] = 'waiting_stamp'
             return
         elif action == 'encrypt':
             await query.edit_message_text("🔑 رمز عبور دلخواه را بفرستید:", reply_markup=get_cancel_btn())
@@ -1044,13 +1186,44 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not state:
         return
 
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+
+    # جمع‌آوری عکس→PDF بدون نیاز به PDF قبلی
+    if state == 'waiting_images_to_pdf':
+        msg = await update.message.reply_text("در حال پردازش... ⏳")
+        out, err = None, None
+        try:
+            if text.strip() in ("تمام", "تمام شد", "done", "Done"):
+                images = context.user_data.get('images', [])
+                if not images:
+                    err = "هیچ عکسی ارسال نشده."
+                else:
+                    result = await asyncio.to_thread(p_images_to_pdf, images)
+                    if isinstance(result, tuple):
+                        out, err = result
+                    else:
+                        out = result
+                context.user_data['images'] = []
+                if err:
+                    await msg.edit_text(f"❌ {err}")
+                elif out:
+                    await context.bot.send_document(chat_id=user_id, document=out)
+                    await msg.delete()
+                context.user_data['state'] = None
+            else:
+                await msg.edit_text("عکس بفرستید یا وقتی تمام شد بنویسید: تمام")
+        except Exception as e:
+            logging.exception("images_to_pdf text")
+            await msg.edit_text(f"❌ خطا: {str(e)[:200]}")
+            context.user_data['state'] = None
+        return
+
     if 'files' not in context.user_data or not context.user_data['files']:
         await update.message.reply_text("❌ فایلی موجود نیست.")
         context.user_data['state'] = None
         return
 
-    text = update.message.text.strip()
-    user_id = update.effective_user.id
     file_bytes = context.user_data['files'][0]
     msg = await update.message.reply_text("در حال پردازش... ⏳")
     out, err = None, None
@@ -1170,21 +1343,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 err = "فرمت اشتباه است. مثال: 2 3"
 
-        elif state == 'waiting_images_to_pdf':
-            if text.strip() in ("تمام", "تمام شد", "done", "Done"):
-                images = context.user_data.get('images', [])
-                if not images:
-                    err = "هیچ عکسی ارسال نشده."
+        elif state == 'waiting_split_every':
+            try:
+                n = int(text.strip())
+                result = await asyncio.to_thread(p_split_every_n, file_bytes, n)
+                if isinstance(result, tuple):
+                    out, err = result
                 else:
-                    result = await asyncio.to_thread(p_images_to_pdf, images)
-                    if isinstance(result, tuple):
-                        out, err = result
-                    else:
-                        out = result
-                context.user_data['images'] = []
-            else:
-                await msg.edit_text("عکس بفرستید یا وقتی تمام شد بنویسید: تمام")
-                return  # state را پاک نکن (finally را رد می‌کنیم با return از تابع)
+                    out = result
+            except Exception:
+                err = "لطفاً فقط یک عدد وارد کنید. مثال: 5"
+
+        elif state == 'waiting_stamp':
+            try:
+                if "|" in text:
+                    pos, stamp = text.split("|", 1)
+                    pos = pos.strip().lower()
+                    stamp = stamp.strip()
+                    if pos not in ("top", "bottom"):
+                        pos = "bottom"
+                else:
+                    pos, stamp = "bottom", text.strip()
+                out = await asyncio.to_thread(p_stamp_text, file_bytes, stamp, pos)
+            except Exception as e:
+                err = f"خطا: {e}"
 
         if err:
             await msg.edit_text(f"❌ {err}")
@@ -1246,6 +1428,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state'] = None
 
 
+
+async def img2pdf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """شروع تبدیل عکس به PDF بدون نیاز به فایل PDF قبلی"""
+    context.user_data['images'] = []
+    context.user_data['state'] = 'waiting_images_to_pdf'
+    await update.message.reply_text(
+        "🖼️ حالت عکس→PDF\nعکس‌ها را یکی‌یکی بفرستید.\nوقتی تمام شد بنویسید: تمام",
+        reply_markup=get_cancel_btn()
+    )
+
+
+
 def main():
     if not TOKEN:
         raise ValueError("BOT_TOKEN environment variable is not set")
@@ -1260,6 +1454,7 @@ def main():
     )
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("img2pdf", img2pdf_cmd))
     application.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
